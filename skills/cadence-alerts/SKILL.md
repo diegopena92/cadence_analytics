@@ -179,6 +179,46 @@ channel itself is the state store for the live routines.
    - Present → reply in that message's thread instead (or skip if already replied today).
 3. Remove ledger entries for keys that no longer appear in the current run's results (resolved).
 
+### Proposed: Hightouch → Google Sheet pipeline (not yet live)
+Motivation: the Snowflake MCP connector's OAuth token expired mid-session twice during
+development (2026-07-31), which would silently break the live routines with no visible error.
+Routing the actual Snowflake execution through Hightouch (a separate, more stable
+service-level Snowflake connection the team already operates) instead of this session's OAuth
+removes that single point of failure — the routine would only need read access to a Google
+Sheet, not a live Snowflake connection of its own.
+
+**Design (agreed 2026-07-31):**
+- One combined Hightouch model, `skills/cadence-alerts/hightouch-combined-model.sql` — all 9
+  checks `UNION ALL`'d into one normalized schema (`check_number`, `check_name`, `cadence_id`,
+  `metric_value`, `reference_value`, `detail`, `as_of`). Validated live against Snowflake
+  (2026-07-31, 88 rows returned across all 9 checks) — this is the exact same filtering/logic as
+  `cadence-alerts.sql`, not a simplified version.
+- Hightouch syncs this model's **already-filtered result rows** (not raw underlying data) to a
+  **single tab** in a Google Sheet, distinguished by `check_number`. An empty sync result for a
+  check means clean — same "silence = clean" semantics as today.
+- The sheet should be owned by or shared with the Google account connected to
+  `mcp__claude_ai_Google_Drive` (believed to be `diego.pena@housecallpro.com` — confirm this,
+  wasn't fully verifiable from Drive metadata alone).
+- The routine would then: read the sheet via `mcp__claude_ai_Google_Drive__read_file_content`
+  (supports `application/vnd.google-apps.spreadsheet`), filter rows by `check_number` per tier
+  (urgent: 1,2,3,4,6; report: 5,7,8,9), and apply the exact same Slack-posting/dedup logic
+  described above — the only thing that changes is where the check *results* come from.
+
+**What's NOT done yet:**
+- Hightouch model/sync creation itself — there's no Hightouch MCP connector available, so this
+  has to happen in Hightouch's own UI/API, by whoever has Hightouch access. This skill only
+  provides the ready-to-paste model SQL.
+- The routine prompts still hit Snowflake directly as of this writing — they have NOT been
+  switched to read the sheet. Do that only once the Hightouch sync is confirmed live and
+  producing rows in the sheet, to avoid a silent gap where nothing points at real data.
+
+**Known tradeoff:** the SQL now conceptually lives in two places — `cadence-alerts.sql` (the
+per-check reference/documentation, and what `cadence-alerts-urgent`/`cadence-alerts-report`
+currently execute directly) and `hightouch-combined-model.sql` (what Hightouch would run). They
+must be updated together by hand whenever a threshold/filter/exclusion changes — there is no
+automatic sync between them. This mirrors the same tradeoff already accepted for checks 2-4's
+exclusion list.
+
 ## Follow-up Q&A in Slack
 This repo runs as scheduled batch jobs, not a hosted Slack app — it cannot itself listen for
 @-mentions and reply live. Follow-up questions in an alert thread are answered by enabling the
@@ -190,10 +230,14 @@ queries against the same tables/knowledge base to answer in-thread.
 - `cadence_step='Test'` = Control (held out) — never produces a `Start` row, so no separate
   exclusion is needed.
 - Known-quiet cadences (Post-Enroll Flywheel: ARPA Engagement, Type 1 Onboarding, Type 1
-  Adoption, Type 1 Nurture, Activation, Warming) don't need an explicit exclusion list in this
-  version: check 6's 4-month liveness gate and checks 7/8's min-10-baseline-volume floor both
-  naturally exclude them (they never clear either threshold) — simpler and self-adjusting versus
-  a hardcoded name list.
+  Adoption, Type 1 Nurture, Activation, Warming): checks 7/8's min-10-baseline-volume floor
+  naturally excludes them (they never clear it) — no explicit list needed there. **Check 6 needs
+  an explicit exclusion list** (corrected 2026-07-31, caught by live validation): the 4-month
+  liveness gate does NOT exclude them the way it does for check 1 — a cadence can clear
+  `surfaced_last_4mo >= 1` on a single stray surfaced step and then trivially show `0` every
+  week after, since it's inherently sparse. Confirmed live: `Warming` and `Activation` fired on
+  check 6 before this fix. `cadence-alerts.sql`/`hightouch-combined-model.sql` check 6 now filters
+  `NOT cadence_id ILIKE ANY (...)` on the same name list.
 - Governed tables (`ANALYTICS.MAIN`) rebuild nightly, not intraday — a same-day "no starts"
   won't show up until the next day's run; this is accepted latency, not a bug in the check.
 - Free-text `cadence_id` is `TRIM()`'d but **not case-normalized** anywhere in this file — a

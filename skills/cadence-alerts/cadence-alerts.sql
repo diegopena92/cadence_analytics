@@ -203,16 +203,22 @@ ORDER BY cadence_id, week_start DESC;
 
 -- ── CHECK 6: No Steps Surfaced in 7 Days ──────────────────────────────────
 -- NEW (not in the original 7-check version). Same silence-gate shape as check 1, on the
--- Salesforce step-surfacing side — catches Iterable-to-Salesforce integration breaks. The
--- 4-month liveness gate naturally excludes known-quiet cadences (ARPA Engagement, Type 1
--- Onboarding/Adoption/Nurture, Activation, Warming) without needing an explicit exclusion list —
--- they never clear starts_last_4mo >= 1 on this table in the first place.
+-- Salesforce step-surfacing side — catches Iterable-to-Salesforce integration breaks.
+-- CORRECTED 2026-07-31 (live validation caught this): the 4-month liveness gate does NOT
+-- naturally exclude known-quiet cadences here — unlike check 1 (Start events, unrelated to the
+-- known-quiet designation), a cadence designed to almost-never surface steps can still clear
+-- `surfaced_last_4mo >= 1` (one stray surfaced step in 4 months is enough) and then trivially
+-- show `surfaced_last_7d = 0` every single week, since it's inherently sparse. Confirmed live:
+-- `Post-Enroll Flywheel: Warming` and `Post-Enroll Flywheel: Activation` (both known-quiet) fired
+-- here before this fix. Explicit exclusion required, matching data-quality-caveats.md's list.
 WITH surfaced_steps AS (
     SELECT cadence_id__c AS cadence_id, email__c AS email, createddate
     FROM hcp_integrations.multi_salesforce_production.decision_engine_step__c
     WHERE step_id__c = 'Call attempt'
       AND name != 'clear_step'
       AND SPLIT_PART(email__c, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
+      AND NOT cadence_id__c ILIKE ANY ('%ARPA Engagement%', '%Type 1 Onboarding%', '%Type 1 Adoption%',
+                                        '%Type 1 Nurture%', '%Activation%', '%Warming%')
 )
 SELECT
     cadence_id,
