@@ -26,17 +26,17 @@ a correctness fix over the original version of this skill, which did not exclude
 | # | Check | Tier | Alert rule |
 |---|---|---|---|
 | 1 | No Starts in 7 Days | Urgent (daily) | Silence gate: `>=1` real Start in trailing 4mo, `0` in trailing 7d |
-| 2 | Double Starts | Urgent (daily) | *Adapted* — new count yesterday >=3σ above the cadence's own 34-day baseline (or any occurrence if baseline is ~0) |
-| 3 | Double Exits | Urgent (daily) | *Adapted* — same baseline-relative rule as check 2 |
-| 4 | Entered, Not Exited in 100+ Days | Urgent (daily) | *Adapted* — same baseline-relative rule, applied to *newly*-crossed pros/day, not the total open backlog |
+| 2 | Double Starts | Urgent (daily) | *Adapted* — any occurrence in the trailing 7 days, excluding known-recurring cadences by name |
+| 3 | Double Exits | Urgent (daily) | *Adapted* — same rule as check 2 |
+| 4 | Entered, Not Exited in 100+ Days | Urgent (daily) | *Adapted* — any pro whose no-exit streak crossed 100 days in the trailing 7 days, same exclusion list |
 | 5 | Drop in Weekly Entries/Exits | Report (Mon+Thu) | 8-week trailing baseline, drop >=2σ below mean, baseline mean >=10/week |
 | 6 | No Steps Surfaced in 7 Days | Urgent (daily) | Silence gate, same shape as check 1, on `decision_engine_step__c` |
 | 7 | Drop in Steps Surfaced | Report (Mon+Thu) | Same 8-week/2σ/min-10 rule as check 5 |
 | 8 | Drop in Steps Completed | Report (Mon+Thu) | Same 8-week/2σ/min-10 rule as check 5 |
 | 9 | Email Volume Drops/Spikes | Report (Mon+Thu) | Same 8-week/2σ/min-10 rule, flags **both** drop and spike |
 
-"Active cadence" (checks 2-4's baseline scope) = had at least one non-internal `Start` row in the
-trailing 180 days — no maintained list, re-discovered fresh on every run.
+Checks 2-4 exclude known-recurring-by-design cadences by name via `NOT TRIM(cadence_id) ILIKE ANY
+(...)` — currently just `%HCP NPS%`. This is a maintained list, not automatic; see below.
 
 ## Two-tier severity design (decided with the requester + their manager's team, 2026-07-31)
 Original design ran everything daily; the requester's manager (Mario) and a stakeholder (Charlie)
@@ -60,22 +60,26 @@ confirming bugs versus expected behavior" for recurring cadences (verified: `HCP
 25-90-150-Recurring` and `Post-Enroll Flywheel: Warming` dominate checks 2-3; the same NPS survey
 tops check 4's backlog at 169,152 pros — all expected for a long-running recurring cadence, not a
 bug). Posting that literal, ever-growing all-time number to Slack every day would repeat a huge,
-barely-changing figure forever for those same cadences — reintroducing the exact noise problem
-this skill's independent validation (2026-07-30) had already found and fixed.
+barely-changing figure forever for those same cadences.
 
-Decision (confirmed with the requester 2026-07-31): keep the source doc's exact domain-exclusion
-filter and event logic, but window checks 2-4 to "new since yesterday" and compare each cadence's
-daily count to its **own trailing 34-day baseline** — flag only if `today > baseline_mean +
-3*baseline_stddev AND today >= 3` (min-count floor avoids paging on a 1-2 event blip), **or**
-`baseline_mean ~= 0 AND today > 0` (a brand-new anomaly in a cadence that's never done this
-before). Validated live pre-domain-exclusion (2026-07-30): `HCP NPS Survey` (945 vs. mean 781,
-σ=109 → 1.5σ, not flagged), `Warming` (917 double-exits vs. mean 408, σ=396 → 1.3σ, not flagged),
-while `Post-Enroll Flywheel: Type 1 to Type 3 Upsell` (51 vs. mean 6.5, σ=14.6 → ~3.0σ) correctly
-stood out as the one real anomaly that day. Re-validate after the domain-exclusion fix lands (it
-should only shrink counts further, not change which cadences are outliers, but confirm).
+Two approaches were tried:
+1. **34-day statistical baseline** (first version, 2026-07-30): compare each cadence's daily count
+   to its own trailing 34-day mean/stddev, flag only outliers. Validated live: correctly suppressed
+   `HCP NPS Survey` (945 vs. mean 781, σ=109 → 1.5σ) and `Warming` (917 double-exits vs. mean 408,
+   σ=396 → 1.3σ) while catching `Post-Enroll Flywheel: Type 1 to Type 3 Upsell` (51 vs. mean 6.5,
+   σ=14.6 → ~3.0σ) as a real anomaly. Worked, but harder to explain/reason about for the team.
+2. **Trailing 7-day window + explicit exclusion list** (current, 2026-07-31, requester's own SQL):
+   count occurrences in the last 7 days, and hard-exclude cadences known to be recurring-by-design
+   via `NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')`. Simpler and more explainable, at the cost of
+   needing the exclusion list maintained by hand — other known-recurring cadences (`Warming`,
+   `Upsell`, `Abandoned My Apps Page`, `Retention - SaaS Cancellation`, `Inbound In Trial`, all
+   confirmed recurring-by-design in the 2026-07-30 validation) are **not yet excluded** and will
+   likely fire weekly until added. Add a cadence to the `ILIKE ANY (...)` list in checks 2-4 (three
+   places each) once it's confirmed to be by-design, not a bug — the ✅/❌ reaction feedback loop
+   (see "Anti-noise design") is the intended way to surface candidates.
 
 Checks 1, 5, 6, 7, 8, 9 are used exactly as the source doc specifies — they're already windowed
-(silence gates or 8-week rolling baselines) and don't have this all-time-cumulative problem.
+(silence gates or 8-week rolling baselines) and never had this all-time-cumulative problem.
 
 ## Check 9's two known caveats (documented, not fixed — from the source doc, verified 2026-07-29)
 1. **Name-match false positive**: the join to `marts.communication.detail_communication_lifecycle`

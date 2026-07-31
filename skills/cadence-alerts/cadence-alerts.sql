@@ -10,18 +10,19 @@
 -- in scope. `cadence_name` does NOT exist on fact_journey_progress_checkpoint (verified live) —
 -- `cadence_id` itself is the free-text descriptive label.
 --
--- CHECKS 2-4 ADAPTATION FOR LIVE DAILY ALERTING: the source artifact's checks 2-4 are all-time
--- cumulative counts with no date window (a one-time diagnostic snapshot) — posting that literally
--- every day would repeat a huge, barely-changing number forever for recurring/evergreen cadences
--- (HCP NPS Survey 25-90-150-Recurring, Warming, Upsell, etc. — the source doc itself flags these
--- as needing human review, not as bugs). Decision (confirmed with requester 2026-07-31): keep the
--- source doc's exact domain-exclusion filter, but window checks 2-4 to "new since yesterday" and
--- compare each cadence's daily count to its own 34-day baseline (>=3 stddev above the mean, or any
--- occurrence if the baseline is ~0) before treating it as alert-worthy — this was independently
--- validated against real data (2026-07-30) to suppress exactly the recurring cadences the source
--- doc calls out, while still catching genuine new anomalies. Checks 1, 5, 6, 7, 8, 9 are used as
--- specified in the source doc (silence gates / 8-week rolling 2-stddev baselines are already
--- windowed and don't have this problem).
+-- CHECKS 2-4 ADAPTATION FOR LIVE DAILY ALERTING (revised 2026-07-31): the source artifact's
+-- checks 2-4 are all-time cumulative counts with no date window (a one-time diagnostic snapshot)
+-- — posting that literally every day would repeat a huge, barely-changing number forever for
+-- recurring/evergreen cadences (the source doc itself flags these as needing human review, not as
+-- bugs). Current approach: window checks 2-4 to a trailing 7-day count (not all-time), and exclude
+-- known recurring-by-design cadences by name via `NOT TRIM(cadence_id) ILIKE ANY (...)` — starting
+-- with `HCP NPS Survey 25-90-150-Recurring` (resent every 25/90/150 days by design). This replaces
+-- an earlier 34-day statistical-baseline-anomaly version of this file (kept simpler/more
+-- explainable per the requester 2026-07-31) — add more cadences to the exclusion list as real
+-- alerts surface them (Warming, Upsell, Abandoned My Apps Page, Retention - SaaS Cancellation, and
+-- Inbound In Trial are also known-recurring from 2026-07-30 validation but not yet excluded; watch
+-- for them). Checks 1, 5, 6, 7, 8, 9 are used as specified in the source doc (silence gates /
+-- 8-week rolling 2-stddev baselines are already windowed and don't have this problem).
 
 -- ── CHECK 1: No Starts in 7 Days ──────────────────────────────────────────
 WITH cadence_events AS (
@@ -41,150 +42,81 @@ HAVING starts_last_4mo >= 1
    AND starts_last_7d = 0
 ORDER BY last_start_ts DESC;
 
--- ── CHECK 2: Double Starts — daily "new since yesterday" vs. own 34-day baseline ──
+-- ── CHECK 2: Double Starts — trailing 7 days, recurring-cadence exclusion list ──
 -- Source doc's exact filters (Start rows, domain exclusion, no-Exit-between-two-Starts logic);
--- windowed + baseline-anomaly-gated per the adaptation note above (not in the source doc).
-WITH active_cadences AS (
-    SELECT DISTINCT TRIM(cadence_id) AS cadence_id
-    FROM analytics.main.fact_journey_progress_checkpoint
-    WHERE cadence_step = 'Start' AND event_timestamp >= DATEADD(day, -180, CURRENT_DATE())
-      AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
-),
-days AS (
-    SELECT DATEADD(day, -seq4(), CURRENT_DATE()) AS day
-    FROM TABLE(GENERATOR(ROWCOUNT => 35))
-),
-grid AS (
-    SELECT c.cadence_id, d.day FROM active_cadences c CROSS JOIN days d
-),
-starts AS (
+-- windowed to 7 days + name-exclusion-gated per the adaptation note above (not in the source doc).
+WITH starts AS (
     SELECT TRIM(cadence_id) AS cadence_id, email, event_timestamp,
            ROW_NUMBER() OVER (PARTITION BY TRIM(cadence_id), email ORDER BY event_timestamp) AS start_seq,
            LAG(event_timestamp) OVER (PARTITION BY TRIM(cadence_id), email ORDER BY event_timestamp) AS prev_start_ts
     FROM analytics.main.fact_journey_progress_checkpoint
     WHERE cadence_step = 'Start'
       AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
+      AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
 ),
 exits AS (
     SELECT TRIM(cadence_id) AS cadence_id, email, event_timestamp AS exit_ts
     FROM analytics.main.fact_journey_progress_checkpoint
     WHERE cadence_step = 'Exit'
       AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
-),
-double_starts AS (
-    SELECT s.cadence_id, s.email, s.prev_start_ts, s.event_timestamp AS this_start_ts,
-           s.event_timestamp::date AS event_date
-    FROM starts s
-    WHERE s.start_seq > 1
-      AND s.event_timestamp >= DATEADD(day, -36, CURRENT_DATE())
-      AND NOT EXISTS (SELECT 1 FROM exits e
-                      WHERE e.cadence_id = s.cadence_id AND e.email = s.email
-                        AND e.exit_ts > s.prev_start_ts AND e.exit_ts < s.event_timestamp)
-),
-daily AS (
-    SELECT cadence_id, event_date, COUNT(*) AS cnt FROM double_starts GROUP BY 1, 2
-),
-joined AS (
-    SELECT g.cadence_id, g.day, COALESCE(dl.cnt, 0) AS cnt
-    FROM grid g LEFT JOIN daily dl ON dl.cadence_id = g.cadence_id AND dl.event_date = g.day
-),
-stats AS (
-    SELECT cadence_id,
-           AVG(CASE WHEN day < DATEADD(day, -1, CURRENT_DATE()) THEN cnt END) AS baseline_mean,
-           STDDEV(CASE WHEN day < DATEADD(day, -1, CURRENT_DATE()) THEN cnt END) AS baseline_stddev,
-           MAX(CASE WHEN day = DATEADD(day, -1, CURRENT_DATE()) THEN cnt END) AS latest_cnt
-    FROM joined GROUP BY cadence_id
+      AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
 )
-SELECT cadence_id, latest_cnt, ROUND(baseline_mean, 2) AS baseline_mean, ROUND(baseline_stddev, 2) AS baseline_stddev
-FROM stats
-WHERE (COALESCE(baseline_mean, 0) = 0 AND latest_cnt > 0)
-   OR (latest_cnt >= 3 AND latest_cnt > baseline_mean + 3 * COALESCE(baseline_stddev, 0))
-ORDER BY latest_cnt DESC;
--- Drill-down (sample emails for a flagged cadence): SELECT email, prev_start_ts, this_start_ts
--- FROM <double_starts CTE> WHERE cadence_id = '<flagged>' AND event_date = DATEADD(day,-1,CURRENT_DATE());
+SELECT s.cadence_id, COUNT(*) AS double_start_count, COUNT(DISTINCT s.email) AS pros_affected
+FROM starts s
+WHERE s.start_seq > 1
+  AND s.event_timestamp >= DATEADD(day, -7, CURRENT_DATE())
+  AND NOT EXISTS (
+      SELECT 1 FROM exits e
+      WHERE e.cadence_id = s.cadence_id AND e.email = s.email
+        AND e.exit_ts > s.prev_start_ts AND e.exit_ts < s.event_timestamp
+  )
+GROUP BY s.cadence_id
+ORDER BY double_start_count DESC;
+-- Drill-down (sample emails for a flagged cadence): rerun the `starts`/`exits` CTEs above, select
+-- s.email, s.prev_start_ts, s.event_timestamp WHERE s.cadence_id = '<flagged>' (same WHERE clause).
 
--- ── CHECK 3: Double Exits — daily "new since yesterday" vs. own 34-day baseline ──
+-- ── CHECK 3: Double Exits — trailing 7 days, recurring-cadence exclusion list ──
 -- Mirror of check 2 on Exit rows. Same adaptation rationale.
-WITH active_cadences AS (
-    SELECT DISTINCT TRIM(cadence_id) AS cadence_id
-    FROM analytics.main.fact_journey_progress_checkpoint
-    WHERE cadence_step = 'Start' AND event_timestamp >= DATEADD(day, -180, CURRENT_DATE())
-      AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
-),
-days AS (
-    SELECT DATEADD(day, -seq4(), CURRENT_DATE()) AS day
-    FROM TABLE(GENERATOR(ROWCOUNT => 35))
-),
-grid AS (
-    SELECT c.cadence_id, d.day FROM active_cadences c CROSS JOIN days d
-),
-exits AS (
+WITH exits AS (
     SELECT TRIM(cadence_id) AS cadence_id, email, event_timestamp,
            ROW_NUMBER() OVER (PARTITION BY TRIM(cadence_id), email ORDER BY event_timestamp) AS exit_seq,
            LAG(event_timestamp) OVER (PARTITION BY TRIM(cadence_id), email ORDER BY event_timestamp) AS prev_exit_ts
     FROM analytics.main.fact_journey_progress_checkpoint
     WHERE cadence_step = 'Exit'
       AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
+      AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
 ),
 starts AS (
     SELECT TRIM(cadence_id) AS cadence_id, email, event_timestamp AS start_ts
     FROM analytics.main.fact_journey_progress_checkpoint
     WHERE cadence_step = 'Start'
       AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
-),
-double_exits AS (
-    SELECT e.cadence_id, e.email, e.prev_exit_ts, e.event_timestamp AS this_exit_ts,
-           e.event_timestamp::date AS event_date
-    FROM exits e
-    WHERE e.exit_seq > 1
-      AND e.event_timestamp >= DATEADD(day, -36, CURRENT_DATE())
-      AND NOT EXISTS (SELECT 1 FROM starts s
-                      WHERE s.cadence_id = e.cadence_id AND s.email = e.email
-                        AND s.start_ts > e.prev_exit_ts AND s.start_ts < e.event_timestamp)
-),
-daily AS (
-    SELECT cadence_id, event_date, COUNT(*) AS cnt FROM double_exits GROUP BY 1, 2
-),
-joined AS (
-    SELECT g.cadence_id, g.day, COALESCE(dl.cnt, 0) AS cnt
-    FROM grid g LEFT JOIN daily dl ON dl.cadence_id = g.cadence_id AND dl.event_date = g.day
-),
-stats AS (
-    SELECT cadence_id,
-           AVG(CASE WHEN day < DATEADD(day, -1, CURRENT_DATE()) THEN cnt END) AS baseline_mean,
-           STDDEV(CASE WHEN day < DATEADD(day, -1, CURRENT_DATE()) THEN cnt END) AS baseline_stddev,
-           MAX(CASE WHEN day = DATEADD(day, -1, CURRENT_DATE()) THEN cnt END) AS latest_cnt
-    FROM joined GROUP BY cadence_id
+      AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
 )
-SELECT cadence_id, latest_cnt, ROUND(baseline_mean, 2) AS baseline_mean, ROUND(baseline_stddev, 2) AS baseline_stddev
-FROM stats
-WHERE (COALESCE(baseline_mean, 0) = 0 AND latest_cnt > 0)
-   OR (latest_cnt >= 3 AND latest_cnt > baseline_mean + 3 * COALESCE(baseline_stddev, 0))
-ORDER BY latest_cnt DESC;
+SELECT e.cadence_id, COUNT(*) AS double_exit_count, COUNT(DISTINCT e.email) AS pros_affected
+FROM exits e
+WHERE e.exit_seq > 1
+  AND e.event_timestamp >= DATEADD(day, -7, CURRENT_DATE())
+  AND NOT EXISTS (
+      SELECT 1 FROM starts s
+      WHERE s.cadence_id = e.cadence_id AND s.email = e.email
+        AND s.start_ts > e.prev_exit_ts AND s.start_ts < e.event_timestamp
+  )
+GROUP BY e.cadence_id
+ORDER BY double_exit_count DESC;
 
--- ── CHECK 4: Newly stuck >100 days — daily "new since yesterday" vs. own 34-day baseline ──
--- "Newly stuck" = pros who crossed the 100-day-no-exit mark on that specific day, not the total
--- open backlog (the backlog is dominated by long-running evergreen cadences by design — the
--- source doc's own check found HCP NPS Survey 25-90-150-Recurring topping the backlog at 169,152
--- pros, consistent with being a long-running recurring cadence, not a bug).
-WITH active_cadences AS (
-    SELECT DISTINCT TRIM(cadence_id) AS cadence_id
-    FROM analytics.main.fact_journey_progress_checkpoint
-    WHERE cadence_step = 'Start' AND event_timestamp >= DATEADD(day, -180, CURRENT_DATE())
-      AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
-),
-days AS (
-    SELECT DATEADD(day, -seq4(), CURRENT_DATE()) AS day
-    FROM TABLE(GENERATOR(ROWCOUNT => 35))
-),
-grid AS (
-    SELECT c.cadence_id, d.day FROM active_cadences c CROSS JOIN days d
-),
-starts AS (
-    SELECT TRIM(cadence_id) AS cadence_id, email, MIN(event_timestamp)::date AS start_date
+-- ── CHECK 4: Newly stuck >100 days — crossed the threshold in the trailing 7 days ──
+-- "Newly stuck" = pros whose no-exit streak crossed 100 days sometime in the last 7 days (100 <=
+-- days_in_cadence < 107), not the total open backlog (the backlog is dominated by long-running
+-- evergreen cadences by design — the source doc's own check found HCP NPS Survey 25-90-150-
+-- Recurring topping the backlog at 169,152 pros, consistent with being a long-running recurring
+-- cadence, not a bug). Same recurring-cadence exclusion list as checks 2-3.
+WITH starts AS (
+    SELECT TRIM(cadence_id) AS cadence_id, email, MIN(event_timestamp) AS start_ts
     FROM analytics.main.fact_journey_progress_checkpoint
     WHERE cadence_step = 'Start'
       AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
+      AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
     GROUP BY 1, 2
 ),
 exits AS (
@@ -192,33 +124,19 @@ exits AS (
     FROM analytics.main.fact_journey_progress_checkpoint
     WHERE cadence_step = 'Exit'
       AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
+      AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
     GROUP BY 1, 2
-),
-crossings AS (
-    SELECT d.day, s.cadence_id, s.email
-    FROM days d JOIN starts s ON s.start_date = DATEADD(day, -100, d.day)
-    LEFT JOIN exits e ON e.cadence_id = s.cadence_id AND e.email = s.email
-    WHERE e.email IS NULL OR e.exit_ts > d.day
-),
-daily AS (
-    SELECT cadence_id, day, COUNT(*) AS cnt FROM crossings GROUP BY 1, 2
-),
-joined AS (
-    SELECT g.cadence_id, g.day, COALESCE(dl.cnt, 0) AS cnt
-    FROM grid g LEFT JOIN daily dl ON dl.cadence_id = g.cadence_id AND dl.day = g.day
-),
-stats AS (
-    SELECT cadence_id,
-           AVG(CASE WHEN day < DATEADD(day, -1, CURRENT_DATE()) THEN cnt END) AS baseline_mean,
-           STDDEV(CASE WHEN day < DATEADD(day, -1, CURRENT_DATE()) THEN cnt END) AS baseline_stddev,
-           MAX(CASE WHEN day = DATEADD(day, -1, CURRENT_DATE()) THEN cnt END) AS latest_cnt
-    FROM joined GROUP BY cadence_id
 )
-SELECT cadence_id, latest_cnt, ROUND(baseline_mean, 2) AS baseline_mean, ROUND(baseline_stddev, 2) AS baseline_stddev
-FROM stats
-WHERE (COALESCE(baseline_mean, 0) = 0 AND latest_cnt > 0)
-   OR (latest_cnt >= 3 AND latest_cnt > baseline_mean + 3 * COALESCE(baseline_stddev, 0))
-ORDER BY latest_cnt DESC;
+SELECT s.cadence_id,
+       COUNT(*) AS newly_stuck_pros,
+       MAX(DATEDIFF(day, s.start_ts, CURRENT_DATE())) AS longest_days_in_cadence
+FROM starts s
+LEFT JOIN exits e ON e.cadence_id = s.cadence_id AND e.email = s.email AND e.exit_ts > s.start_ts
+WHERE e.email IS NULL
+  AND DATEDIFF(day, s.start_ts, CURRENT_DATE()) >= 100
+  AND DATEDIFF(day, s.start_ts, CURRENT_DATE()) < 107
+GROUP BY s.cadence_id
+ORDER BY newly_stuck_pros DESC;
 
 -- ── CHECK 5: Drop in Weekly Entries/Exits — 8-week baseline, 2 stddev, min 10/week ──
 -- Verbatim from the source doc. Excludes the in-progress current week (required — without it,
