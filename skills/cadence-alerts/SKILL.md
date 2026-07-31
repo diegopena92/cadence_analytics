@@ -113,15 +113,18 @@ Two durable cloud routines are running against `#cadence-analytics-alerts`
 Manage both at https://claude.ai/code/routines (list/update/run-now via `RemoteTrigger`; deletion
 is web-UI only).
 
-**Why these don't use the local ledger file or read this repo:** cloud routines run in an isolated
-environment with no access to this local, non-git-tracked project directory, and each scheduled
-run is a fresh session with no shared filesystem across runs. So the routine prompts are
-**self-contained** — the full SQL for each check is embedded directly in the routine's prompt
-text (copied from `cadence-alerts.sql`) rather than read from this repo. Consequence: **tuning a
-threshold means updating the routine directly** (`RemoteTrigger` `update`, or re-run the `schedule`
-skill), not just editing `cadence-alerts.sql` here — the two will drift out of sync unless both are
-updated together. If this repo is ever pushed to a git remote, the routines could be rewritten to
-clone it fresh each run instead.
+**Repo access:** this project is pushed to https://github.com/diegopena92/cadence_analytics
+(public). Both routines have that repo attached as a `git_repository` source, so each run clones
+it fresh and reads `skills/cadence-alerts/SKILL.md` + `cadence-alerts.sql` directly — tuning a
+threshold here and pushing is enough; no separate routine-prompt edit needed. (Earlier versions of
+these routines carried the SQL inline in the prompt because this project wasn't yet a pushed repo —
+if repo access ever breaks, that's the fallback: embed the SQL directly in the routine prompt via
+`RemoteTrigger` `update` instead of relying on the clone.)
+
+**Why not the local ledger file:** cloud routines run in an isolated environment with no shared
+filesystem across runs — even with the repo cloned fresh each time, there's no persistent place to
+write back `outputs/alerts/cadence-alerts-state.json` between runs (and it's gitignored, so
+committing it back isn't the intended pattern either). Hence the Slack-history dedup below instead.
 
 **Repeat-suppression without a ledger file:** each run reads the channel's own recent message
 history (`slack_read_channel` on `C0BMUN6PRGQ`) and looks for an existing top-level message
