@@ -50,8 +50,11 @@ while genuinely broken cadences ("egregious" issues) still need to surface fast.
   8-week statistical drops/spikes, inherently a weekly-grain signal; a routine dip doesn't need
   same-day attention. Runs **twice a week (Monday + Thursday)**, and — unlike the urgent tier —
   **always posts something**, even "nothing to call out," specifically so the team can tell the
-  bot is still running. When something is flagged, the Slack post links to a full **Google Doc**
-  report with the detail (see "Slack message format" and "Running it" below).
+  bot is still running. **This is NOT a plain sequential recap of all 9 checks** — it runs a
+  3-way decision tree that always surfaces a ranked "who's most critical" answer (top-3 cadences,
+  by single-check severity or by repeat-offense across checks) rather than just listing everything
+  — see "Slack message format" below for the exact tree and required output shape; that section
+  is authoritative over this paragraph if they ever seem to disagree.
 
 ## Why checks 2-4 differ from the source doc (important — read before changing)
 The source doc's checks 2-4 are **all-time cumulative counts with no date window** — a one-time
