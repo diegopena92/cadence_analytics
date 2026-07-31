@@ -1,6 +1,6 @@
 ---
 name: cadence-alerts
-description: Run the 9-check Multi-Cadence Bug Diagnostic across all active cadences and post to the #cadence-analytics-alerts Slack channel, split into two severity tiers — "run the cadence alerts", "check for cadence mechanical issues", "post today's cadence alerts". Urgent tier (checks 1,2,3,4,6) runs daily, silent on a clean day; report tier (checks 5,7,8,9, recapping all 9) runs Mon+Thu and always posts something, with a full Google Doc report linked when anything's flagged. For a single-cadence deep dive use `bug-diagnostic` instead; for general performance use `four-stage-funnel`.
+description: Run the 9-check Multi-Cadence Bug Diagnostic across all active cadences and post to the #cadence-analytics-alerts Slack channel, split into two severity tiers — "run the cadence alerts", "check for cadence mechanical issues", "post today's cadence alerts". Urgent tier (checks 1,2,3,4,6) runs daily, silent on a clean day, immediate per-item posts. Report tier (checks 5,7,8,9, recapping all 9) runs Mon+Thu with a 3-way decision tree: nothing flagged → liveness ping only; one check flagged → top 3 cadences for that check; multiple checks flagged → top 3 repeat-offender cadences across checks — plus an HTML-built Google Doc styled as a slide deck (max 10 sections) for the latter two cases. For a single-cadence deep dive use `bug-diagnostic` instead; for general performance use `four-stage-funnel`.
 ---
 
 # Cadence Mechanical Alerts
@@ -122,17 +122,45 @@ Repeat occurrences of an already-open alert are posted as a **reply in that mess
 a new top-level message.
 
 ### Report tier (checks 5, 7, 8, 9 + full recap — twice a week, one consolidated post)
-1. Build a Google Doc (via the Google Drive MCP connector) titled `Cadence Alerts Report —
-   <date>` covering all 9 checks: for each, either "clean" or the flagged cadences with their
-   numbers (actual, baseline mean, baseline stddev / threshold). This is the closest available
-   substitute for a literal PDF — no PDF-rendering tool is available to the bot, but a Google Doc
-   is a real, portable, downloadable document (anyone with the link can export it to PDF).
-2. Post ONE short Slack message linking to it:
-   - Nothing flagged anywhere: `**Cadence Alerts Report — <date>** — Nothing to call out this
-     run. Full report: <link>` (this liveness ping is intentional — see tier design above).
-   - Something flagged: `**Cadence Alerts Report — <date>** — <N> cadence(s) flagged across <M>
-     check(s), see full report: <link>` plus a one-line list of which checks/cadences.
-No new top-level message per item, no thread dedup — one message, one doc, twice a week.
+Three-way decision tree (agreed with the requester 2026-07-31), evaluated over all 9 checks for
+the current period (checks 1-4/6: today; checks 5/7/8/9: the most recent week in the sheet):
+
+1. **Nothing flagged in any of the 9 checks** → post only: `**Cadence Alerts Report — <date>** —
+   Nothing to report this run.` No attachment, no doc. (Liveness ping — confirms the bot ran.)
+2. **Exactly one check has flagged rows** → rank that check's flagged cadences by severity
+   (`ABS(metric_value - reference_value)` descending when `reference_value` isn't null, else
+   `metric_value` descending) and take the top 3 (fewer if fewer exist). Post a short message
+   naming the check and those 3 cadence IDs, plus the slide-deck doc (below).
+3. **Two or more checks have flagged rows** → find the 3 **repeat offenders**: cadences appearing
+   in the most *distinct* check_numbers this period. Normalize `cadence_id` casing (`UPPER()`)
+   before grouping — otherwise the known casing-duplicate cadences (see check 9's caveats) would
+   undercount as two different cadences instead of one repeat offender. Tie-break by combined
+   severity (sum of each appearance's `ABS(metric_value - reference_value)`, treating null
+   `reference_value` as 0). Post a short message: how many of the 9 checks fired, the top 3
+   offenders and how many checks each appeared in, plus the slide-deck doc.
+
+**The "slide-deck" doc** (built for cases 2 and 3, skipped for case 1): a Google Doc built from
+**HTML content** (not plain text — plain text doesn't convert to real headings/bullets; HTML does,
+verified 2026-07-31), styled to read like a presentation, max 10 sections total:
+- **Section 1 ("Slide 1 — Overview")**: a list of all 9 checks with how many cadences each
+  flagged this period (0 for clean ones — full landscape, not just the active ones), followed by
+  the top-3 offenders/cadences callout from whichever branch (2 or 3) applied.
+- **Sections 2+ ("Slide 2 — <Check Name>", "Slide 3 — <Check Name>", ...)**: one section per
+  check_number that has >=1 flagged row this period, in ascending check_number order (lowest
+  flagged check_number = "first misalert" = slide 2) — each listing its flagged cadences with
+  `cadence_id`, `metric_value`, `reference_value`, `detail`.
+- Since there are exactly 9 possible checks, worst case is 1 overview + 9 detail sections = 10 —
+  matches the stated 10-slide cap exactly, no truncation logic needed.
+- This is the closest achievable substitute for a literal PDF slide deck — true Google Slides
+  requires uploading a real `.pptx` binary (confirmed 2026-07-31: `create_file` rejects plain-text
+  content for the native presentation mime type), which isn't reliably buildable without a
+  presentation-generation library that may not exist in the routine's sandbox. An HTML-sourced
+  Google Doc, structured with one heading per "slide," is downloadable as an actual PDF by anyone
+  with the link and was validated to convert with real headings/bullets (not literal `#`/`-`
+  characters, which is what plain-text upload produces).
+
+No new top-level message per item, no thread dedup — one message (+ doc when applicable), twice a
+week.
 
 Neither tier infers cause in the alert text (house rule — `context/analysis-approaches.md` #2):
 state the number, not a guess at why it moved.
