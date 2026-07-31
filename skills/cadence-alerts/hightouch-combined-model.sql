@@ -7,10 +7,16 @@
 -- cadence-alerts.sql by hand whenever a threshold/filter changes there; see SKILL.md's
 -- "Hightouch pipeline" section for the tradeoff this creates (SQL now lives in two places).
 --
--- Output schema (every check normalizes to these 7 columns):
+-- Output schema (every check normalizes to these 9 columns):
+--   id             TEXT    -- UNIQUE PER ROW — map this as the primary key in Hightouch's sync
+--                             config. check_number|cadence_id|as_of, plus |sub_key for checks 5/9
+--                             (see "id" note above the final UNION ALL for why it's built this way)
 --   check_number   INT     -- 1-9, matches cadence-alerts.sql / SKILL.md numbering
 --   check_name     TEXT    -- human-readable check name, for the Slack message headline
 --   cadence_id     TEXT    -- the flagged cadence
+--   sub_key        TEXT    -- disambiguates checks 5 ('entries'/'exits') and 9 ('drop'/'spike');
+--                             NULL for every other check, which only ever emit one row per
+--                             cadence+as_of
 --   metric_value   NUMBER  -- the actual value that triggered the flag
 --   reference_value NUMBER -- the baseline mean / threshold it's compared against (NULL if n/a)
 --   detail         TEXT    -- extra context (affected pros, stddev, week_start, direction, etc.)
@@ -322,59 +328,77 @@ c9_agg AS (
       AND baseline_weeks >= 8 AND baseline_mean >= 10 AND email_volume >= baseline_mean + 2 * baseline_sd
 )
 
--- ── Final UNION ALL — normalized to the common 7-column schema ───────────
-SELECT 1 AS check_number, 'No Starts in 7 Days' AS check_name, cadence_id,
+-- ── Final UNION ALL — normalized to the common schema, plus a unique `id` ──
+-- Hightouch (like any sync tool) requires a primary-key column to tell rows apart between runs.
+-- `check_number` + `cadence_id` + `as_of` is unique for every check EXCEPT 5 and 9, which can
+-- emit two rows for the same cadence/week (entries vs. exits; drop vs. spike) — `sub_key` carries
+-- that differentiator (NULL everywhere else). `id` concatenates all four into one text column so
+-- Hightouch has a single field to map as the primary key, regardless of whether composite keys
+-- are supported for the destination. Built to be STABLE across re-runs of the same period (same
+-- check+cadence+as_of+sub_key → same id → Hightouch updates that row in place with fresher
+-- numbers) but CHANGE when the period rolls over (as_of advances daily for checks 1-4/6, weekly
+-- for 5/7/8/9) — so history accumulates as new rows instead of being silently overwritten.
+SELECT '1|' || cadence_id || '|' || TO_VARCHAR(CURRENT_DATE()) AS id,
+       1 AS check_number, 'No Starts in 7 Days' AS check_name, cadence_id, NULL AS sub_key,
        starts_last_7d AS metric_value, 7 AS reference_value,
        'last_start_ts=' || TO_VARCHAR(last_start_ts) AS detail, CURRENT_DATE() AS as_of
 FROM c1_agg WHERE starts_last_4mo >= 1 AND starts_last_7d = 0
 
 UNION ALL
-SELECT 2, 'Double Starts', cadence_id,
+SELECT '2|' || cadence_id || '|' || TO_VARCHAR(CURRENT_DATE()),
+       2, 'Double Starts', cadence_id, NULL,
        double_start_count, NULL,
        'pros_affected=' || pros_affected, CURRENT_DATE()
 FROM c2_agg
 
 UNION ALL
-SELECT 3, 'Double Exits', cadence_id,
+SELECT '3|' || cadence_id || '|' || TO_VARCHAR(CURRENT_DATE()),
+       3, 'Double Exits', cadence_id, NULL,
        double_exit_count, NULL,
        'pros_affected=' || pros_affected, CURRENT_DATE()
 FROM c3_agg
 
 UNION ALL
-SELECT 4, 'Entered Not Exited in 100+ Days', cadence_id,
+SELECT '4|' || cadence_id || '|' || TO_VARCHAR(CURRENT_DATE()),
+       4, 'Entered Not Exited in 100+ Days', cadence_id, NULL,
        newly_stuck_pros, 100,
        'longest_days_in_cadence=' || longest_days_in_cadence, CURRENT_DATE()
 FROM c4_agg
 
 UNION ALL
-SELECT 5, 'Drop in Weekly Entries/Exits', cadence_id,
+SELECT '5|' || cadence_id || '|' || TO_VARCHAR(week_start) || '|' || metric_name,
+       5, 'Drop in Weekly Entries/Exits', cadence_id, metric_name,
        value, ROUND(baseline_mean, 1),
        'metric=' || metric_name || '; baseline_sd=' || ROUND(baseline_sd, 1) || '; week_start=' || TO_VARCHAR(week_start),
        week_start
 FROM c5_agg
 
 UNION ALL
-SELECT 6, 'No Steps Surfaced in 7 Days', cadence_id,
+SELECT '6|' || cadence_id || '|' || TO_VARCHAR(CURRENT_DATE()),
+       6, 'No Steps Surfaced in 7 Days', cadence_id, NULL,
        surfaced_last_7d, 7,
        'last_surfaced_ts=' || TO_VARCHAR(last_surfaced_ts), CURRENT_DATE()
 FROM c6_agg WHERE surfaced_last_4mo >= 1 AND surfaced_last_7d = 0
 
 UNION ALL
-SELECT 7, 'Drop in Steps Surfaced', cadence_id,
+SELECT '7|' || cadence_id || '|' || TO_VARCHAR(week_start),
+       7, 'Drop in Steps Surfaced', cadence_id, NULL,
        value, ROUND(baseline_mean, 1),
        'baseline_sd=' || ROUND(baseline_sd, 1) || '; week_start=' || TO_VARCHAR(week_start),
        week_start
 FROM c7_agg
 
 UNION ALL
-SELECT 8, 'Drop in Steps Completed', cadence_id,
+SELECT '8|' || cadence_id || '|' || TO_VARCHAR(week_start),
+       8, 'Drop in Steps Completed', cadence_id, NULL,
        value, ROUND(baseline_mean, 1),
        'baseline_sd=' || ROUND(baseline_sd, 1) || '; week_start=' || TO_VARCHAR(week_start),
        week_start
 FROM c8_agg
 
 UNION ALL
-SELECT 9, 'Email Volume Drops/Spikes', cadence_id,
+SELECT '9|' || cadence_id || '|' || TO_VARCHAR(week_start) || '|' || direction,
+       9, 'Email Volume Drops/Spikes', cadence_id, direction,
        value, ROUND(baseline_mean, 1),
        'direction=' || direction || '; baseline_sd=' || ROUND(baseline_sd, 1) || '; week_start=' || TO_VARCHAR(week_start),
        week_start
