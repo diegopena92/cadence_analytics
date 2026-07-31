@@ -1,6 +1,6 @@
 ---
 name: cadence-alerts
-description: Run the 9-check Multi-Cadence Bug Diagnostic across all active cadences and post to the #cadence-analytics-alerts Slack channel, split into two severity tiers — "run the cadence alerts", "check for cadence mechanical issues", "post today's cadence alerts". Urgent tier (checks 1,2,3,4,6) runs daily, silent on a clean day, immediate per-item posts. Report tier (checks 5,7,8,9, recapping all 9) runs Mon+Thu with a 3-way decision tree: nothing flagged → liveness ping only; one check flagged → top 3 cadences for that check; multiple checks flagged → top 3 repeat-offender cadences across checks — plus an HTML-built Google Doc styled as a slide deck (max 10 sections) for the latter two cases. For a single-cadence deep dive use `bug-diagnostic` instead; for general performance use `four-stage-funnel`.
+description: Run the 9-check Multi-Cadence Bug Diagnostic across all active cadences and post to the #cadence-analytics-alerts Slack channel, split into two severity tiers — "run the cadence alerts", "check for cadence mechanical issues", "post today's cadence alerts". Urgent tier (checks 1,2,3,4,6) runs daily, silent on a clean day, immediate per-item posts. Report tier (checks 5,7,8,9, recapping all 9) runs Mon+Thu with a 3-way decision tree: nothing flagged → liveness ping only; one check flagged → top 3 cadences for that check; multiple checks flagged → top 3 repeat-offender cadences across checks — plus a published HTML artifact styled as a slide deck (max 10 sections) for the latter two cases. For a single-cadence deep dive use `bug-diagnostic` instead; for general performance use `four-stage-funnel`.
 ---
 
 # Cadence Mechanical Alerts
@@ -132,38 +132,76 @@ the current period (checks 1-4/6: today; checks 5/7/8/9: the most recent week in
    Nothing to report this run.` No attachment, no doc. (Liveness ping — confirms the bot ran.)
 2. **Exactly one check has flagged rows** → rank that check's flagged cadences by severity
    (`ABS(metric_value - reference_value)` descending when `reference_value` isn't null, else
-   `metric_value` descending) and take the top 3 (fewer if fewer exist). Post a short message
-   naming the check and those 3 cadence IDs, plus the slide-deck doc (below).
+   `metric_value` descending) and take the top 3 (fewer if fewer exist). Post a structured
+   multi-line message naming the check and those 3 cadences, plus the visual report (below).
 3. **Two or more checks have flagged rows** → find the 3 **repeat offenders**: cadences appearing
    in the most *distinct* check_numbers this period. Normalize `cadence_id` casing (`UPPER()`)
    before grouping — otherwise the known casing-duplicate cadences (see check 9's caveats) would
    undercount as two different cadences instead of one repeat offender. Tie-break by combined
    severity (sum of each appearance's `ABS(metric_value - reference_value)`, treating null
-   `reference_value` as 0). Post a short message: how many of the 9 checks fired, the top 3
-   offenders and how many checks each appeared in, plus the slide-deck doc.
+   `reference_value` as 0). Post a structured multi-line message: how many of the 9 checks fired,
+   the top 3 offenders and how many checks each appeared in (check names spelled out, never bare
+   numbers), plus the visual report.
 
-**The "slide-deck" doc** (built for cases 2 and 3, skipped for case 1): a Google Doc built from
-**HTML content** (not plain text — plain text doesn't convert to real headings/bullets; HTML does,
-verified 2026-07-31), styled to read like a presentation, max 10 sections total:
-- **Section 1 ("Slide 1 — Overview")**: a list of all 9 checks with how many cadences each
-  flagged this period (0 for clean ones — full landscape, not just the active ones), followed by
-  the top-3 offenders/cadences callout from whichever branch (2 or 3) applied.
-- **Sections 2+ ("Slide 2 — <Check Name>", "Slide 3 — <Check Name>", ...)**: one section per
-  check_number that has >=1 flagged row this period, in ascending check_number order (lowest
-  flagged check_number = "first misalert" = slide 2) — each listing its flagged cadences with
-  `cadence_id`, `metric_value`, `reference_value`, `detail`.
-- Since there are exactly 9 possible checks, worst case is 1 overview + 9 detail sections = 10 —
-  matches the stated 10-slide cap exactly, no truncation logic needed.
-- This is the closest achievable substitute for a literal PDF slide deck — true Google Slides
-  requires uploading a real `.pptx` binary (confirmed 2026-07-31: `create_file` rejects plain-text
-  content for the native presentation mime type), which isn't reliably buildable without a
-  presentation-generation library that may not exist in the routine's sandbox. An HTML-sourced
-  Google Doc, structured with one heading per "slide," is downloadable as an actual PDF by anyone
-  with the link and was validated to convert with real headings/bullets (not literal `#`/`-`
-  characters, which is what plain-text upload produces).
+**Slack message shape** (revised 2026-07-31 — the requester found the original single-run-on-
+sentence version hard to parse and explicitly preferred an earlier multi-line draft): headline on
+its own line, a one-line summary sentence, a blank line, a bolded "Top ..." lead-in, a numbered
+list with one cadence per line and check names spelled out (never `(2, 3, 4, 9)` — always
+`(Double Starts, Double Exits, Entered Not Exited 100+ Days, Email Volume Spike)`), a blank line,
+then the report link on its own line. Not a single dense paragraph.
 
-No new top-level message per item, no thread dedup — one message (+ doc when applicable), twice a
-week.
+**The visual report** (built for cases 2 and 3, skipped for case 1): a published **HTML
+artifact** (switched from a Google-Doc-via-HTML-upload approach on 2026-07-31 — the requester
+doesn't need Doc-style collaboration/commenting on this report, and an artifact is simpler to
+build: write the file, call `Artifact`, done — no Drive mimetype-conversion step). **Redesigned
+again same day** after the first artifact version (plain `<h1>`/`<ul>`/`<li>` text, ported straight
+from the old slide-deck doc) was rejected as "awful" / visually flat. Current version, following
+the `dataviz` skill's procedure (form → color-by-job → validated status/sequential palette → mark
+spec → table-view accessibility twin):
+- **Hero stat**: a big `<N>/9` figure with a status-colored chip (warning 1-3 flagged, serious 4-6,
+  critical 7-9 — the `dataviz` skill's fixed status palette, never a themed/categorical hue).
+- **Overview bar chart**: one horizontal bar per check (sequential single-hue blue, magnitude =
+  cadence count that check flagged this period), muted/zero-width for the two clean checks — a
+  real chart, not a bulleted count list.
+- **Top-3 offenders bar chart**: horizontal bars in the status-critical hue, sized by checks-flagged
+  (or by severity score in the single-check branch), each with a row of pill "chips" spelling out
+  which checks it was flagged in.
+- **Per-check detail sections**: real `<table>`s (not card/bullet lists) — columns tailored per
+  check's actual semantics (e.g. check 2/3 get a `Count` column, check 4 gets `Days`, checks
+  5/7/8/9 get `This week`/`Baseline`), sorted descending by the primary column, monospace
+  right-aligned numbers. This is the accessible "table view" the `dataviz` skill calls for
+  alongside any chart.
+- Fixed CSS custom properties (light + dark, both `prefers-color-scheme` and the viewer's
+  `data-theme` toggle) drawn from the `dataviz` skill's validated reference palette
+  (`references/palette.md`) — sequential blue for magnitude, status red for the critical/offenders
+  charts — not invented per-run.
+- Written to `outputs/charts/cadence-alerts-report_<date>.html`, then published via the `Artifact`
+  tool (favicon 🔔). The routine calls the `artifact-design` skill once first per that tool's own
+  requirement.
+- The live routine's `allowed_tools` needed `Write`, `Artifact`, and `Skill` added (previously
+  just `Bash`, `Read`, `Grep`, `Glob`) for this to work — see trigger `job_config.session_context`.
+
+**Access — fixed permanent URL (added 2026-07-31, important — do not regress this):** Artifacts
+publish **private by default** (owner-only) with no API/tool to set sharing programmatically —
+confirmed the requester's manager (boss) couldn't open the first two test-run artifacts. A raw
+`.html` upload to Google Drive (`disableConversionToGoogleType: true`) was tried as a workaround —
+it *does* inherit the same `tryhousecall.com` domain-wide reader permission Google Docs get, but
+Drive's preview only shows the HTML as literal source code, not a rendered page, so that path was
+abandoned. The actual fix: artifact sharing is a **per-artifact, not per-version** setting, so the
+routine now **always redeploys to one fixed, permanent artifact URL** —
+`https://claude.ai/code/artifact/5e2dfa30-279f-40de-a65b-517329740044` — instead of minting a new
+one each run. That URL was manually shared **once** via the Share panel (General access:
+"Everyone in Housecall Pro", Can view); every subsequent redeploy to the same URL keeps that
+setting. The trigger's step 5c always passes `url: <that fixed URL>` to the `Artifact` tool and
+never omits it — omitting `url` would mint a fresh, unshared artifact. If this URL is ever lost or
+needs rotating, a human must open the new artifact once and re-set General access by hand — there
+is no way to script that step.
+- The exact CSS/HTML template (class names, palette variables, per-check column mapping) lives
+  verbatim in the `cadence-alerts-report` trigger's instructions, not duplicated here — see
+  `trig_018zAoMWLt2snuhJm1cnJSfY` via `RemoteTrigger` if it needs hand-editing again.
+
+No new top-level message per item, no thread dedup — one message (+ report when applicable), twice
+a week.
 
 Neither tier infers cause in the alert text (house rule — `context/analysis-approaches.md` #2):
 state the number, not a guess at why it moved.
@@ -177,7 +215,7 @@ created via the `schedule` skill / `RemoteTrigger`:
   14:00 UTC (~10am ET). Silent on a clean day.
 - **`cadence-alerts-report`** (`trig_018zAoMWLt2snuhJm1cnJSfY`) — checks 5, 7, 8, 9 plus a recap
   of 1-4/6, **Monday and Thursday** at 14:00 UTC (`cron: 0 14 * * 1,4`). Always posts something —
-  a liveness ping if clean, or a summary + Google Doc link if anything's flagged.
+  a liveness ping if clean, or a summary + HTML artifact link if anything's flagged.
 
 Manage both at https://claude.ai/code/routines (list/update/run-now via `RemoteTrigger`; deletion
 is web-UI only). Schedule note: Monday/Thursday was Mario's latest stated preference in the
@@ -204,7 +242,7 @@ routines with no visible error. Instead:
   "last synced at" column, so this is a heuristic, not a guarantee — if Hightouch ever syncs an
   empty/partial result within that 8-day window, it would look identical to "genuinely clean."
 - Dedup logic is otherwise unchanged: urgent tier still checks Slack history per check+cadence
-  before posting; report tier still posts one fresh consolidated message + Google Doc per run.
+  before posting; report tier still posts one fresh consolidated message + HTML artifact per run.
 
 **Known tradeoff:** the check SQL now lives in two files — `cadence-alerts.sql` (reference/
 documentation of the per-check logic; not directly executed by the live routines anymore) and
