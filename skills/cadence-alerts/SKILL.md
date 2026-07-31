@@ -1,6 +1,6 @@
 ---
 name: cadence-alerts
-description: Run the 9-check Multi-Cadence Bug Diagnostic across all active cadences and post threshold-breaching results to the #cadence-analytics-alerts Slack channel — "run the cadence alerts", "check for cadence mechanical issues", "post today's cadence alerts". Checks 1,2,3,4,6 run daily, checks 5,7,8,9 run weekly. For a single-cadence deep dive use `bug-diagnostic` instead; for general performance use `four-stage-funnel`.
+description: Run the 9-check Multi-Cadence Bug Diagnostic across all active cadences and post to the #cadence-analytics-alerts Slack channel, split into two severity tiers — "run the cadence alerts", "check for cadence mechanical issues", "post today's cadence alerts". Urgent tier (checks 1,2,3,4,6) runs daily, silent on a clean day; report tier (checks 5,7,8,9, recapping all 9) runs Mon+Thu and always posts something, with a full Google Doc report linked when anything's flagged. For a single-cadence deep dive use `bug-diagnostic` instead; for general performance use `four-stage-funnel`.
 ---
 
 # Cadence Mechanical Alerts
@@ -22,21 +22,36 @@ Every query excludes internal/test traffic: `SPLIT_PART(email, '@', 2) NOT IN ('
 stays in scope (61 rows, legitimate test-persona traffic the team wants visibility into). This is
 a correctness fix over the original version of this skill, which did not exclude internal traffic.
 
-## Scope: 9 checks, two run frequencies
-| # | Check | Frequency | Alert rule |
+## Scope: 9 checks, two severity tiers
+| # | Check | Tier | Alert rule |
 |---|---|---|---|
-| 1 | No Starts in 7 Days | Daily | Silence gate: `>=1` real Start in trailing 4mo, `0` in trailing 7d |
-| 2 | Double Starts | Daily | *Adapted* — new count yesterday >=3σ above the cadence's own 34-day baseline (or any occurrence if baseline is ~0) |
-| 3 | Double Exits | Daily | *Adapted* — same baseline-relative rule as check 2 |
-| 4 | Entered, Not Exited in 100+ Days | Daily | *Adapted* — same baseline-relative rule, applied to *newly*-crossed pros/day, not the total open backlog |
-| 5 | Drop in Weekly Entries/Exits | Weekly (Mon) | 8-week trailing baseline, drop >=2σ below mean, baseline mean >=10/week |
-| 6 | No Steps Surfaced in 7 Days | Daily | Silence gate, same shape as check 1, on `decision_engine_step__c` |
-| 7 | Drop in Steps Surfaced | Weekly (Mon) | Same 8-week/2σ/min-10 rule as check 5 |
-| 8 | Drop in Steps Completed | Weekly (Mon) | Same 8-week/2σ/min-10 rule as check 5 |
-| 9 | Email Volume Drops/Spikes | Weekly (Mon) | Same 8-week/2σ/min-10 rule, flags **both** drop and spike |
+| 1 | No Starts in 7 Days | Urgent (daily) | Silence gate: `>=1` real Start in trailing 4mo, `0` in trailing 7d |
+| 2 | Double Starts | Urgent (daily) | *Adapted* — new count yesterday >=3σ above the cadence's own 34-day baseline (or any occurrence if baseline is ~0) |
+| 3 | Double Exits | Urgent (daily) | *Adapted* — same baseline-relative rule as check 2 |
+| 4 | Entered, Not Exited in 100+ Days | Urgent (daily) | *Adapted* — same baseline-relative rule, applied to *newly*-crossed pros/day, not the total open backlog |
+| 5 | Drop in Weekly Entries/Exits | Report (Mon+Thu) | 8-week trailing baseline, drop >=2σ below mean, baseline mean >=10/week |
+| 6 | No Steps Surfaced in 7 Days | Urgent (daily) | Silence gate, same shape as check 1, on `decision_engine_step__c` |
+| 7 | Drop in Steps Surfaced | Report (Mon+Thu) | Same 8-week/2σ/min-10 rule as check 5 |
+| 8 | Drop in Steps Completed | Report (Mon+Thu) | Same 8-week/2σ/min-10 rule as check 5 |
+| 9 | Email Volume Drops/Spikes | Report (Mon+Thu) | Same 8-week/2σ/min-10 rule, flags **both** drop and spike |
 
 "Active cadence" (checks 2-4's baseline scope) = had at least one non-internal `Start` row in the
 trailing 180 days — no maintained list, re-discovered fresh on every run.
+
+## Two-tier severity design (decided with the requester + their manager's team, 2026-07-31)
+Original design ran everything daily; the requester's manager (Mario) and a stakeholder (Charlie)
+flagged in a separate Slack thread that daily statistical-drop alerts would become white noise,
+while genuinely broken cadences ("egregious" issues) still need to surface fast. Resolution:
+- **Urgent tier** (checks 1, 2, 3, 4, 6) — these are either silence gates (a cadence went
+  completely dark) or baseline anomalies (something new and abnormal just happened). Both mean
+  something likely just broke. Runs **daily**, posts **immediately** and **individually** per
+  breaching check/cadence, **stays silent on a clean day** (no white noise — these should be rare).
+- **Report tier** (checks 5, 7, 8, 9, plus a recap of 1-4/6's current status) — these are
+  8-week statistical drops/spikes, inherently a weekly-grain signal; a routine dip doesn't need
+  same-day attention. Runs **twice a week (Monday + Thursday)**, and — unlike the urgent tier —
+  **always posts something**, even "nothing to call out," specifically so the team can tell the
+  bot is still running. When something is flagged, the Slack post links to a full **Google Doc**
+  report with the detail (see "Slack message format" and "Running it" below).
 
 ## Why checks 2-4 differ from the source doc (important — read before changing)
 The source doc's checks 2-4 are **all-time cumulative counts with no date window** — a one-time
@@ -74,17 +89,24 @@ Checks 1, 5, 6, 7, 8, 9 are used exactly as the source doc specifies — they're
    else in this file — a shared limitation, not unique to check 9).
 
 ## Anti-noise design ("don't become white noise")
-1. **Silence on a clean run.** No "all clear" digest message — only post when a check breaches.
-2. **One message per breaching check per cadence**, not a giant combined digest — mirrors
-   `#hcp_kpi_alerts`' granularity so each issue can be reacted to/threaded independently.
-3. **Repeat-suppression via Slack history** (live routines) or a local ledger (manual runs) — see
-   "Running it" below.
+1. **Silence on a clean urgent-tier day.** No "all clear" message from the daily routine — only
+   post when checks 1/2/3/4/6 actually breach. (The report tier is the exception — see tier
+   design above — it always posts something, by design, twice a week only.)
+2. **One message per breaching check per cadence** on the urgent tier, not a giant combined
+   digest — mirrors `#hcp_kpi_alerts`' granularity so each issue can be reacted to/threaded
+   independently. The report tier is the opposite on purpose: one consolidated digest, not nine
+   separate messages, because it's meant to be skimmed twice a week, not reacted to per-item.
+3. **Repeat-suppression via Slack history** (live routines, urgent tier only) or a local ledger
+   (manual runs) — see "Running it" below. The report tier doesn't need this: each Mon/Thu run is
+   a fresh periodic digest, not a persistent alert needing suppression.
 4. **Feedback loop** — ask people to react ✅ (expected/legit) or ❌ (false positive/not useful) on
-   alerts, same convention as `#hcp_kpi_alerts`. Review reactions periodically and use ❌ patterns
-   to adjust thresholds — this repo has no automated model-retraining loop, so that review is
-   manual.
+   urgent-tier alerts, same convention as `#hcp_kpi_alerts`. Review reactions periodically and use
+   ❌ patterns to adjust thresholds — this repo has no automated model-retraining loop, so that
+   review is manual.
 
 ## Slack message format
+
+### Urgent tier (checks 1, 2, 3, 4, 6 — immediate, per breaching check/cadence)
 Sent via `mcp__claude_ai_Slack__slack_send_message`, which renders standard markdown (`**bold**`,
 `_italic_`), not Slack's native `*bold*` mrkdwn — use `**...**` for the headline:
 ```
@@ -93,21 +115,41 @@ Sent via `mcp__claude_ai_Slack__slack_send_message`, which renders standard mark
 _React ✅ if expected, ❌ if this shouldn't have fired. @Claude in this thread for more detail._
 ```
 Repeat occurrences of an already-open alert are posted as a **reply in that message's thread**, not
-a new top-level message. No cause inference in the alert text (house rule —
-`context/analysis-approaches.md` #2): state the number, not a guess at why it moved.
+a new top-level message.
+
+### Report tier (checks 5, 7, 8, 9 + full recap — twice a week, one consolidated post)
+1. Build a Google Doc (via the Google Drive MCP connector) titled `Cadence Alerts Report —
+   <date>` covering all 9 checks: for each, either "clean" or the flagged cadences with their
+   numbers (actual, baseline mean, baseline stddev / threshold). This is the closest available
+   substitute for a literal PDF — no PDF-rendering tool is available to the bot, but a Google Doc
+   is a real, portable, downloadable document (anyone with the link can export it to PDF).
+2. Post ONE short Slack message linking to it:
+   - Nothing flagged anywhere: `**Cadence Alerts Report — <date>** — Nothing to call out this
+     run. Full report: <link>` (this liveness ping is intentional — see tier design above).
+   - Something flagged: `**Cadence Alerts Report — <date>** — <N> cadence(s) flagged across <M>
+     check(s), see full report: <link>` plus a one-line list of which checks/cadences.
+No new top-level message per item, no thread dedup — one message, one doc, twice a week.
+
+Neither tier infers cause in the alert text (house rule — `context/analysis-approaches.md` #2):
+state the number, not a guess at why it moved.
 
 ## Running it
 
 ### Live automated routines (production path)
 Two durable cloud routines run against `#cadence-analytics-alerts` (channel_id `C0BMUN6PRGQ`),
 created via the `schedule` skill / `RemoteTrigger`:
-- **`cadence-alerts-daily`** (`trig_01BkdGEqvTH2NMSpPvaree9p`) — checks 1, 2, 3, 4, 6, daily at
-  14:00 UTC (~10am ET, after the nightly `ANALYTICS.MAIN` rebuild).
-- **`cadence-alerts-weekly`** (`trig_018zAoMWLt2snuhJm1cnJSfY`) — checks 5, 7, 8, 9, Mondays at
-  14:00 UTC.
+- **`cadence-alerts-urgent`** (`trig_01BkdGEqvTH2NMSpPvaree9p`) — checks 1, 2, 3, 4, 6, daily at
+  14:00 UTC (~10am ET, after the nightly `ANALYTICS.MAIN` rebuild). Silent on a clean day.
+- **`cadence-alerts-report`** (`trig_018zAoMWLt2snuhJm1cnJSfY`) — checks 5, 7, 8, 9 plus a recap
+  of 1-4/6, **Monday and Thursday** at 14:00 UTC (`cron: 0 14 * * 1,4`). Always posts something —
+  a liveness ping if clean, or a summary + Google Doc link if anything's flagged. Has the Google
+  Drive MCP connector attached (connector_uuid `f25b56e1-3cbe-49ab-8356-baa87364d549`) in addition
+  to Snowflake and Slack, to create the report doc.
 
 Manage both at https://claude.ai/code/routines (list/update/run-now via `RemoteTrigger`; deletion
-is web-UI only).
+is web-UI only). Schedule note: Monday/Thursday was Mario's latest stated preference in the
+requirements thread as of 2026-07-31, pending final confirmation against the team's sprint
+grooming days — if that changes, update the `cadence-alerts-report` cron expression.
 
 **Repo access:** this project is pushed to https://github.com/diegopena92/cadence_analytics
 (public). Both routines have that repo attached as a `git_repository` source, so each run clones
