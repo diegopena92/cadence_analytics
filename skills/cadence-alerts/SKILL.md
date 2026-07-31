@@ -143,81 +143,54 @@ state the number, not a guess at why it moved.
 Two durable cloud routines run against `#cadence-analytics-alerts` (channel_id `C0BMUN6PRGQ`),
 created via the `schedule` skill / `RemoteTrigger`:
 - **`cadence-alerts-urgent`** (`trig_01BkdGEqvTH2NMSpPvaree9p`) — checks 1, 2, 3, 4, 6, daily at
-  14:00 UTC (~10am ET, after the nightly `ANALYTICS.MAIN` rebuild). Silent on a clean day.
+  14:00 UTC (~10am ET). Silent on a clean day.
 - **`cadence-alerts-report`** (`trig_018zAoMWLt2snuhJm1cnJSfY`) — checks 5, 7, 8, 9 plus a recap
   of 1-4/6, **Monday and Thursday** at 14:00 UTC (`cron: 0 14 * * 1,4`). Always posts something —
-  a liveness ping if clean, or a summary + Google Doc link if anything's flagged. Has the Google
-  Drive MCP connector attached (connector_uuid `f25b56e1-3cbe-49ab-8356-baa87364d549`) in addition
-  to Snowflake and Slack, to create the report doc.
+  a liveness ping if clean, or a summary + Google Doc link if anything's flagged.
 
 Manage both at https://claude.ai/code/routines (list/update/run-now via `RemoteTrigger`; deletion
 is web-UI only). Schedule note: Monday/Thursday was Mario's latest stated preference in the
 requirements thread as of 2026-07-31, pending final confirmation against the team's sprint
 grooming days — if that changes, update the `cadence-alerts-report` cron expression.
 
-**Repo access:** this project is pushed to https://github.com/diegopena92/cadence_analytics
-(public). Both routines have that repo attached as a `git_repository` source, so each run clones
-it fresh and reads this file + `cadence-alerts.sql` directly — tuning a threshold here and pushing
-is enough; no separate routine-prompt edit needed, UNLESS the set of checks assigned to a routine
-changes (that's stated in the routine's prompt text itself and needs a `RemoteTrigger` `update`).
+### Data source: Hightouch → Google Sheet (live as of 2026-07-31)
+Neither routine queries Snowflake directly anymore. **Why:** the Snowflake MCP connector's OAuth
+token expired mid-session twice during development, which would have silently broken the live
+routines with no visible error. Instead:
+- A Hightouch model, `skills/cadence-alerts/hightouch-combined-model.sql`, runs all 9 checks
+  (`UNION ALL`'d into one normalized schema — see the file's header comment for the exact column
+  list) on Hightouch's own schedule, using Hightouch's own (more stable, service-level) Snowflake
+  connection — not this session's OAuth.
+- Hightouch syncs the already-filtered result rows to a single tab in a Google Sheet:
+  https://docs.google.com/spreadsheets/d/1SJ15lieGu4QiX50LQO8huifU-FTZ9qxXWp-J8rGg7Fs — shared
+  with the Google account connected to `mcp__claude_ai_Google_Drive`. Primary key for the sync is
+  the model's `id` column (see the file for how it's built — `check_number|cadence_id|as_of`,
+  plus `sub_key` for checks 5/9, which can emit two rows per cadence/period).
+- Each routine reads that sheet (`mcp__claude_ai_Google_Drive__read_file_content`), filters to its
+  tier's `CHECK_NUMBER`s, and — **before treating an empty result as "clean"** — runs a staleness
+  guard: if the max `AS_OF` across the whole sheet is more than 8 days old, it posts a warning
+  that the Hightouch sync may have stalled instead of silently assuming a clean day. There's no
+  "last synced at" column, so this is a heuristic, not a guarantee — if Hightouch ever syncs an
+  empty/partial result within that 8-day window, it would look identical to "genuinely clean."
+- Dedup logic is otherwise unchanged: urgent tier still checks Slack history per check+cadence
+  before posting; report tier still posts one fresh consolidated message + Google Doc per run.
 
-**Why not the local ledger file for the live routines:** cloud routines run in an isolated
-environment with no shared filesystem across runs — even with the repo cloned fresh each time,
-there's no persistent place to write back `outputs/alerts/cadence-alerts-state.json` between runs
-(and it's gitignored, so committing it back isn't the intended pattern either). Each run instead
-reads the channel's own recent message history (`slack_read_channel` on `C0BMUN6PRGQ`) and checks
-whether a top-level message for the same check + cadence (and, for weekly checks, the same week)
-already exists and is still open — if so, it replies in that thread instead of posting new. The
-channel itself is the state store for the live routines.
+**Known tradeoff:** the check SQL now lives in two files — `cadence-alerts.sql` (reference/
+documentation of the per-check logic; not directly executed by the live routines anymore) and
+`hightouch-combined-model.sql` (what Hightouch actually runs). They must be updated together by
+hand whenever a threshold/filter/exclusion changes — no automatic sync between them. This mirrors
+the tradeoff already accepted for checks 2-4's exclusion list, just one level up.
 
 ### Manual/interactive run (ledger-based, for ad hoc use in this repo)
-1. Run each check in `cadence-alerts.sql` via `mcp__claude_ai_Snowflake__sql_exec_tool`.
+For ad hoc analyst use (not the live routines), run `cadence-alerts.sql` directly against
+Snowflake rather than reading the sheet — it's the more current/flexible reference copy.
+1. Run each check via `mcp__claude_ai_Snowflake__sql_exec_tool`.
 2. For each returned row, check the ledger (`outputs/alerts/cadence-alerts-state.json`) for
    `{check, cadence_id, key}`:
    - Not present → format and post a new top-level Slack message to `#cadence-analytics-alerts`
      via `mcp__claude_ai_Slack__slack_send_message`; record the returned `thread_ts` in the ledger.
    - Present → reply in that message's thread instead (or skip if already replied today).
 3. Remove ledger entries for keys that no longer appear in the current run's results (resolved).
-
-### Proposed: Hightouch → Google Sheet pipeline (not yet live)
-Motivation: the Snowflake MCP connector's OAuth token expired mid-session twice during
-development (2026-07-31), which would silently break the live routines with no visible error.
-Routing the actual Snowflake execution through Hightouch (a separate, more stable
-service-level Snowflake connection the team already operates) instead of this session's OAuth
-removes that single point of failure — the routine would only need read access to a Google
-Sheet, not a live Snowflake connection of its own.
-
-**Design (agreed 2026-07-31):**
-- One combined Hightouch model, `skills/cadence-alerts/hightouch-combined-model.sql` — all 9
-  checks `UNION ALL`'d into one normalized schema (`check_number`, `check_name`, `cadence_id`,
-  `metric_value`, `reference_value`, `detail`, `as_of`). Validated live against Snowflake
-  (2026-07-31, 88 rows returned across all 9 checks) — this is the exact same filtering/logic as
-  `cadence-alerts.sql`, not a simplified version.
-- Hightouch syncs this model's **already-filtered result rows** (not raw underlying data) to a
-  **single tab** in a Google Sheet, distinguished by `check_number`. An empty sync result for a
-  check means clean — same "silence = clean" semantics as today.
-- The sheet should be owned by or shared with the Google account connected to
-  `mcp__claude_ai_Google_Drive` (believed to be `diego.pena@housecallpro.com` — confirm this,
-  wasn't fully verifiable from Drive metadata alone).
-- The routine would then: read the sheet via `mcp__claude_ai_Google_Drive__read_file_content`
-  (supports `application/vnd.google-apps.spreadsheet`), filter rows by `check_number` per tier
-  (urgent: 1,2,3,4,6; report: 5,7,8,9), and apply the exact same Slack-posting/dedup logic
-  described above — the only thing that changes is where the check *results* come from.
-
-**What's NOT done yet:**
-- Hightouch model/sync creation itself — there's no Hightouch MCP connector available, so this
-  has to happen in Hightouch's own UI/API, by whoever has Hightouch access. This skill only
-  provides the ready-to-paste model SQL.
-- The routine prompts still hit Snowflake directly as of this writing — they have NOT been
-  switched to read the sheet. Do that only once the Hightouch sync is confirmed live and
-  producing rows in the sheet, to avoid a silent gap where nothing points at real data.
-
-**Known tradeoff:** the SQL now conceptually lives in two places — `cadence-alerts.sql` (the
-per-check reference/documentation, and what `cadence-alerts-urgent`/`cadence-alerts-report`
-currently execute directly) and `hightouch-combined-model.sql` (what Hightouch would run). They
-must be updated together by hand whenever a threshold/filter/exclusion changes — there is no
-automatic sync between them. This mirrors the same tradeoff already accepted for checks 2-4's
-exclusion list.
 
 ## Follow-up Q&A in Slack
 This repo runs as scheduled batch jobs, not a hosted Slack app — it cannot itself listen for
