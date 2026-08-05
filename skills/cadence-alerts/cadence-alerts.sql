@@ -10,14 +10,18 @@
 -- in scope. `cadence_name` does NOT exist on fact_journey_progress_checkpoint (verified live) —
 -- `cadence_id` itself is the free-text descriptive label.
 --
--- CHECKS 2-4 ADAPTATION FOR LIVE DAILY ALERTING (revised 2026-07-31): the source artifact's
--- checks 2-4 are all-time cumulative counts with no date window (a one-time diagnostic snapshot)
--- — posting that literally every day would repeat a huge, barely-changing number forever for
--- recurring/evergreen cadences (the source doc itself flags these as needing human review, not as
--- bugs). Current approach: window checks 2-4 to a trailing 7-day count (not all-time), and exclude
--- known recurring-by-design cadences by name via `NOT TRIM(cadence_id) ILIKE ANY (...)` — starting
--- with `HCP NPS Survey 25-90-150-Recurring` (resent every 25/90/150 days by design). This replaces
--- an earlier 34-day statistical-baseline-anomaly version of this file (kept simpler/more
+-- CHECKS 2-4 ADAPTATION FOR LIVE DAILY ALERTING (revised 2026-07-31, thresholds revised again
+-- 2026-08-03): the source artifact's checks 2-4 are all-time cumulative counts with no date
+-- window (a one-time diagnostic snapshot) — posting that literally every day would repeat a huge,
+-- barely-changing number forever for recurring/evergreen cadences (the source doc itself flags
+-- these as needing human review, not as bugs). Current approach: window checks 2-4 to a trailing
+-- 7-day count (not all-time), exclude known recurring-by-design cadences by name via `NOT
+-- TRIM(cadence_id) ILIKE ANY (...)` — starting with `HCP NPS Survey 25-90-150-Recurring` (resent
+-- every 25/90/150 days by design) — and, as of 2026-08-03 (requester's manager feedback), flag on
+-- a **percentage** of the relevant denominator rather than a raw count: checks 2/3 as % of that
+-- same trailing-7-day window's total starts/exits (>10%), check 4 as % of the cadence's own
+-- currently-active pool that's stuck >=100 days (>=10%) instead of a "newly crossed" count. This
+-- replaces an earlier 34-day statistical-baseline-anomaly version of this file (kept simpler/more
 -- explainable per the requester 2026-07-31) — add more cadences to the exclusion list as real
 -- alerts surface them (Warming, Upsell, Abandoned My Apps Page, Retention - SaaS Cancellation, and
 -- Inbound In Trial are also known-recurring from 2026-07-30 validation but not yet excluded; watch
@@ -42,9 +46,15 @@ HAVING starts_last_4mo >= 1
    AND starts_last_7d = 0
 ORDER BY last_start_ts DESC;
 
--- ── CHECK 2: Double Starts — trailing 7 days, recurring-cadence exclusion list ──
--- Source doc's exact filters (Start rows, domain exclusion, no-Exit-between-two-Starts logic);
--- windowed to 7 days + name-exclusion-gated per the adaptation note above (not in the source doc).
+-- ── CHECK 2: Double Starts — >10% of trailing-7-day starts, recurring-cadence exclusion list ──
+-- REVISED 2026-08-03 (requester's manager feedback, reducing alert volume): threshold changed
+-- from "any occurrence in 7 days" to "double starts are >10% of total starts in that same 7-day
+-- window" — a raw count doesn't distinguish a high-volume cadence throwing off a handful of
+-- dupes from a low-volume one where every start is doubling. Denominator uses the same trailing
+-- 7-day window as the numerator (not a single day) to avoid noisy/volatile % on low-volume
+-- cadences — a single day's total starts can be too small a sample. Exclusion list is still
+-- needed even with % framing: for recurring-by-design cadences a "double start" (2nd Start with
+-- no Exit between) can itself be the expected re-send mechanism, so a high % there isn't a bug.
 WITH starts AS (
     SELECT TRIM(cadence_id) AS cadence_id, email, event_timestamp,
            ROW_NUMBER() OVER (PARTITION BY TRIM(cadence_id), email ORDER BY event_timestamp) AS start_seq,
@@ -60,23 +70,39 @@ exits AS (
     WHERE cadence_step = 'Exit'
       AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
       AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
+),
+doubles AS (
+    SELECT s.cadence_id, s.email
+    FROM starts s
+    WHERE s.start_seq > 1
+      AND s.event_timestamp >= DATEADD(day, -7, CURRENT_DATE())
+      AND NOT EXISTS (
+          SELECT 1 FROM exits e
+          WHERE e.cadence_id = s.cadence_id AND e.email = s.email
+            AND e.exit_ts > s.prev_start_ts AND e.exit_ts < s.event_timestamp
+      )
+),
+totals AS (
+    SELECT cadence_id, COUNT(*) AS total_starts_7d
+    FROM starts
+    WHERE event_timestamp >= DATEADD(day, -7, CURRENT_DATE())
+    GROUP BY cadence_id
 )
-SELECT s.cadence_id, COUNT(*) AS double_start_count, COUNT(DISTINCT s.email) AS pros_affected
-FROM starts s
-WHERE s.start_seq > 1
-  AND s.event_timestamp >= DATEADD(day, -7, CURRENT_DATE())
-  AND NOT EXISTS (
-      SELECT 1 FROM exits e
-      WHERE e.cadence_id = s.cadence_id AND e.email = s.email
-        AND e.exit_ts > s.prev_start_ts AND e.exit_ts < s.event_timestamp
-  )
-GROUP BY s.cadence_id
-ORDER BY double_start_count DESC;
+SELECT d.cadence_id,
+       COUNT(*) AS double_start_count,
+       COUNT(DISTINCT d.email) AS pros_affected,
+       t.total_starts_7d,
+       ROUND(COUNT(*) / NULLIF(t.total_starts_7d, 0), 4) AS double_start_pct
+FROM doubles d
+JOIN totals t ON t.cadence_id = d.cadence_id
+GROUP BY d.cadence_id, t.total_starts_7d
+HAVING double_start_pct > 0.10
+ORDER BY double_start_pct DESC;
 -- Drill-down (sample emails for a flagged cadence): rerun the `starts`/`exits` CTEs above, select
 -- s.email, s.prev_start_ts, s.event_timestamp WHERE s.cadence_id = '<flagged>' (same WHERE clause).
 
--- ── CHECK 3: Double Exits — trailing 7 days, recurring-cadence exclusion list ──
--- Mirror of check 2 on Exit rows. Same adaptation rationale.
+-- ── CHECK 3: Double Exits — >10% of trailing-7-day exits, recurring-cadence exclusion list ──
+-- Mirror of check 2 on Exit rows. Same 2026-08-03 % revision and rationale.
 WITH exits AS (
     SELECT TRIM(cadence_id) AS cadence_id, email, event_timestamp,
            ROW_NUMBER() OVER (PARTITION BY TRIM(cadence_id), email ORDER BY event_timestamp) AS exit_seq,
@@ -92,31 +118,61 @@ starts AS (
     WHERE cadence_step = 'Start'
       AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
       AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
+),
+doubles AS (
+    SELECT e.cadence_id, e.email
+    FROM exits e
+    WHERE e.exit_seq > 1
+      AND e.event_timestamp >= DATEADD(day, -7, CURRENT_DATE())
+      AND NOT EXISTS (
+          SELECT 1 FROM starts s
+          WHERE s.cadence_id = e.cadence_id AND s.email = e.email
+            AND s.start_ts > e.prev_exit_ts AND s.start_ts < e.event_timestamp
+      )
+),
+totals AS (
+    SELECT cadence_id, COUNT(*) AS total_exits_7d
+    FROM exits
+    WHERE event_timestamp >= DATEADD(day, -7, CURRENT_DATE())
+    GROUP BY cadence_id
 )
-SELECT e.cadence_id, COUNT(*) AS double_exit_count, COUNT(DISTINCT e.email) AS pros_affected
-FROM exits e
-WHERE e.exit_seq > 1
-  AND e.event_timestamp >= DATEADD(day, -7, CURRENT_DATE())
-  AND NOT EXISTS (
-      SELECT 1 FROM starts s
-      WHERE s.cadence_id = e.cadence_id AND s.email = e.email
-        AND s.start_ts > e.prev_exit_ts AND s.start_ts < e.event_timestamp
-  )
-GROUP BY e.cadence_id
-ORDER BY double_exit_count DESC;
+SELECT d.cadence_id,
+       COUNT(*) AS double_exit_count,
+       COUNT(DISTINCT d.email) AS pros_affected,
+       t.total_exits_7d,
+       ROUND(COUNT(*) / NULLIF(t.total_exits_7d, 0), 4) AS double_exit_pct
+FROM doubles d
+JOIN totals t ON t.cadence_id = d.cadence_id
+GROUP BY d.cadence_id, t.total_exits_7d
+HAVING double_exit_pct > 0.10
+ORDER BY double_exit_pct DESC;
 
--- ── CHECK 4: Newly stuck >100 days — crossed the threshold in the trailing 7 days ──
--- "Newly stuck" = pros whose no-exit streak crossed 100 days sometime in the last 7 days (100 <=
--- days_in_cadence < 107), not the total open backlog (the backlog is dominated by long-running
--- evergreen cadences by design — the source doc's own check found HCP NPS Survey 25-90-150-
--- Recurring topping the backlog at 169,152 pros, consistent with being a long-running recurring
--- cadence, not a bug). Same recurring-cadence exclusion list as checks 2-3.
+-- ── CHECK 4: Stuck >100 days — >10% of currently-active pros in the cadence ──
+-- REVISED 2026-08-03 (requester's manager feedback): threshold changed from an absolute
+-- "newly crossed 100 days in the trailing 7 days" count to a % of the cadence's own currently-
+-- active pool — pros entered-but-not-exited with days_in_cadence >= 100, divided by all pros
+-- entered-but-not-exited regardless of duration. This replaces the "newly stuck" windowing that
+-- existed specifically to avoid repeating a huge, barely-changing absolute backlog number every
+-- day (source doc found HCP NPS Survey 25-90-150-Recurring topping the backlog at 169,152 pros,
+-- expected for a long-running recurring cadence, not a bug) — a %-of-active-pool metric is
+-- self-normalizing across cadence size, so the same anti-noise goal is now served by the % framing
+-- itself plus the urgent tier's existing per-check/cadence Slack-thread repeat-suppression (see
+-- "Anti-noise design" in SKILL.md), rather than by a "newly crossed" time window. Same recurring-
+-- cadence exclusion list as checks 2-3, kept for consistency — re-validate empirically (see
+-- SKILL.md) whether it's still needed once % results are in.
+-- REVISED AGAIN 2026-08-05 (Diego): added a trailing-120-day entrant window on Start, matching the
+-- "12-month/4-month entrant window" idea already discussed in the check-4 validation notes below
+-- for taming the 82%-fire-rate problem. First pasted with the DATEADD sign flipped
+-- (`DATEADD(day, 120, CURRENT_DATE())`, a FUTURE date — `event_timestamp >= <future date>` can
+-- never match anything, confirmed live at 0 rows); corrected to `-120` (trailing 120 days) before
+-- shipping.
 WITH starts AS (
     SELECT TRIM(cadence_id) AS cadence_id, email, MIN(event_timestamp) AS start_ts
     FROM analytics.main.fact_journey_progress_checkpoint
     WHERE cadence_step = 'Start'
       AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
       AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
+      AND event_timestamp >= DATEADD(day, -120, CURRENT_DATE())
     GROUP BY 1, 2
 ),
 exits AS (
@@ -126,17 +182,22 @@ exits AS (
       AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
       AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
     GROUP BY 1, 2
+),
+active AS (
+    SELECT s.cadence_id, s.email, DATEDIFF(day, s.start_ts, CURRENT_DATE()) AS days_in_cadence
+    FROM starts s
+    LEFT JOIN exits e ON e.cadence_id = s.cadence_id AND e.email = s.email AND e.exit_ts > s.start_ts
+    WHERE e.email IS NULL
 )
-SELECT s.cadence_id,
-       COUNT(*) AS newly_stuck_pros,
-       MAX(DATEDIFF(day, s.start_ts, CURRENT_DATE())) AS longest_days_in_cadence
-FROM starts s
-LEFT JOIN exits e ON e.cadence_id = s.cadence_id AND e.email = s.email AND e.exit_ts > s.start_ts
-WHERE e.email IS NULL
-  AND DATEDIFF(day, s.start_ts, CURRENT_DATE()) >= 100
-  AND DATEDIFF(day, s.start_ts, CURRENT_DATE()) < 107
-GROUP BY s.cadence_id
-ORDER BY newly_stuck_pros DESC;
+SELECT cadence_id,
+       COUNT(*) AS active_pros,
+       COUNT_IF(days_in_cadence >= 100) AS stuck_pros,
+       ROUND(COUNT_IF(days_in_cadence >= 100) / NULLIF(COUNT(*), 0), 4) AS stuck_pct,
+       MAX(days_in_cadence) AS longest_days_in_cadence
+FROM active
+GROUP BY cadence_id
+HAVING stuck_pct >= 0.10
+ORDER BY stuck_pct DESC;
 
 -- ── CHECK 5: Drop in Weekly Entries/Exits — 8-week baseline, 2 stddev, min 10/week ──
 -- Verbatim from the source doc. Excludes the in-progress current week (required — without it,
@@ -201,35 +262,65 @@ WHERE week_start >= DATEADD(week, -4, CURRENT_DATE())
   AND (entries_drop_flag OR exits_drop_flag)
 ORDER BY cadence_id, week_start DESC;
 
--- ── CHECK 6: No Steps Surfaced in 7 Days ──────────────────────────────────
--- NEW (not in the original 7-check version). Same silence-gate shape as check 1, on the
--- Salesforce step-surfacing side — catches Iterable-to-Salesforce integration breaks.
--- CORRECTED 2026-07-31 (live validation caught this): the 4-month liveness gate does NOT
--- naturally exclude known-quiet cadences here — unlike check 1 (Start events, unrelated to the
--- known-quiet designation), a cadence designed to almost-never surface steps can still clear
--- `surfaced_last_4mo >= 1` (one stray surfaced step in 4 months is enough) and then trivially
--- show `surfaced_last_7d = 0` every single week, since it's inherently sparse. Confirmed live:
--- `Post-Enroll Flywheel: Warming` and `Post-Enroll Flywheel: Activation` (both known-quiet) fired
--- here before this fix. Explicit exclusion required, matching data-quality-caveats.md's list.
-WITH surfaced_steps AS (
-    SELECT cadence_id__c AS cadence_id, email__c AS email, createddate
+-- ── CHECK 6: Low Engagement on Recent Starts — <10% of the 3-10 day cohort engaged ──
+-- REDEFINED 2026-08-05 (Mario's request via Slack thread, refined proposal checkmarked
+-- 2026-08-05 — see SKILL.md's check-6 section for the full history). Replaces the old
+-- silence-gate shape (0 surfaced in trailing 7d) with a per-cohort engagement ratio, the same
+-- %-of-denominator pattern checks 2-4 moved to on 2026-08-03. For each cadence: cohort = pros
+-- whose Start fell 3-10 days ago; a pro counts as "engaged" if they have ANY step surfaced, step
+-- completed, or email sent for that cadence, any time from their Start through today (Diego's
+-- call, 2026-08-05 — not restricted back to the 3-10 day window itself); alert if
+-- engaged_pct < 10%. Keeps the known-quiet/non-rep-driven exclusion list from the old check 6
+-- (Mario flagged this need too, e.g. Warming) — live-validate whether it's still needed now that
+-- "email sent" is part of the success criteria (a nurture-only cadence may now clear 10% on the
+-- email leg alone).
+-- Email-sent leg: `marts.communication.detail_communication_lifecycle` has no email column, so
+-- it's joined through `marts.communication.detail_emails` (`comm_id = message_id`) to get
+-- `pro_email_address`, then matched to the cohort by email. Cadence match is still
+-- `workflow_name ILIKE '%cadence_id%'`, the same substring approach check 9 uses (same
+-- false-positive risk on short/prefix-sharing cadence names — spot-check flags).
+WITH cohort AS (
+    SELECT TRIM(cadence_id) AS cadence_id, email, event_timestamp AS start_ts
+    FROM analytics.main.fact_journey_progress_checkpoint
+    WHERE cadence_step = 'Start'
+      AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
+      AND NOT TRIM(cadence_id) ILIKE ANY ('%ARPA Engagement%', '%Type 1 Onboarding%', '%Type 1 Adoption%',
+                                            '%Type 1 Nurture%', '%Activation%', '%Warming%', '%HCP NPS%')
+      AND event_timestamp::date BETWEEN DATEADD(day, -10, CURRENT_DATE()) AND DATEADD(day, -3, CURRENT_DATE())
+),
+steps AS (
+    SELECT TRIM(cadence_id__c) AS cadence_id, email__c AS email, createddate, result_date_time__c
     FROM hcp_integrations.multi_salesforce_production.decision_engine_step__c
-    WHERE step_id__c = 'Call attempt'
-      AND name != 'clear_step'
+    WHERE step_id__c = 'Call attempt' AND name != 'clear_step'
       AND SPLIT_PART(email__c, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
-      AND NOT cadence_id__c ILIKE ANY ('%ARPA Engagement%', '%Type 1 Onboarding%', '%Type 1 Adoption%',
-                                        '%Type 1 Nurture%', '%Activation%', '%Warming%')
+),
+emails_sent AS (
+    SELECT dcl.workflow_name, de.pro_email_address AS email, dcl.comm_date
+    FROM marts.communication.detail_communication_lifecycle dcl
+    JOIN marts.communication.detail_emails de ON dcl.comm_id = de.message_id
+    WHERE dcl.workflow_name IS NOT NULL
+),
+engaged AS (
+    SELECT c.cadence_id, c.email
+    FROM cohort c
+    JOIN steps s ON s.cadence_id = c.cadence_id AND s.email = c.email
+                 AND (s.createddate >= c.start_ts OR s.result_date_time__c >= c.start_ts)
+    UNION
+    SELECT c.cadence_id, c.email
+    FROM cohort c
+    JOIN emails_sent e ON e.workflow_name ILIKE '%' || c.cadence_id || '%' AND e.email = c.email
+                       AND e.comm_date >= c.start_ts
 )
 SELECT
-    cadence_id,
-    COUNT_IF(createddate >= DATEADD(month, -4, CURRENT_DATE())) AS surfaced_last_4mo,
-    COUNT_IF(createddate >= DATEADD(day, -7, CURRENT_DATE()))   AS surfaced_last_7d,
-    MAX(createddate)                                             AS last_surfaced_ts
-FROM surfaced_steps
-GROUP BY cadence_id
-HAVING surfaced_last_4mo >= 1
-   AND surfaced_last_7d = 0
-ORDER BY last_surfaced_ts DESC;
+    c.cadence_id,
+    COUNT(DISTINCT c.email)  AS cohort_size,
+    COUNT(DISTINCT eg.email) AS engaged_count,
+    ROUND(COUNT(DISTINCT eg.email) / NULLIF(COUNT(DISTINCT c.email), 0), 4) AS engaged_pct
+FROM cohort c
+LEFT JOIN engaged eg ON eg.cadence_id = c.cadence_id AND eg.email = c.email
+GROUP BY c.cadence_id
+HAVING engaged_pct < 0.10
+ORDER BY engaged_pct ASC;
 
 -- ── CHECK 7: Drop in Steps Surfaced — 8-week baseline, 2 stddev, min 10/week ──
 -- Verbatim from the source doc. The min-10-volume floor naturally excludes known-quiet cadences

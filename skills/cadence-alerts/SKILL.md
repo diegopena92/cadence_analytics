@@ -26,11 +26,11 @@ a correctness fix over the original version of this skill, which did not exclude
 | # | Check | Tier | Alert rule |
 |---|---|---|---|
 | 1 | No Starts in 7 Days | Urgent (daily) | Silence gate: `>=1` real Start in trailing 4mo, `0` in trailing 7d |
-| 2 | Double Starts | Urgent (daily) | *Adapted* — any occurrence in the trailing 7 days, excluding known-recurring cadences by name |
-| 3 | Double Exits | Urgent (daily) | *Adapted* — same rule as check 2 |
-| 4 | Entered, Not Exited in 100+ Days | Urgent (daily) | *Adapted* — any pro whose no-exit streak crossed 100 days in the trailing 7 days, same exclusion list |
+| 2 | Double Starts | Urgent (daily) | *Adapted* — double starts >10% of that same trailing-7-day window's total starts, excluding known-recurring cadences by name |
+| 3 | Double Exits | Urgent (daily) | *Adapted* — same rule as check 2, on exits |
+| 4 | Entered, Not Exited in 100+ Days | Urgent (daily) | *Adapted* — >=10% of the cadence's currently-active pool (entered, not exited) has been stuck 100+ days, same exclusion list |
 | 5 | Drop in Weekly Entries/Exits | Report (Mon+Thu) | 8-week trailing baseline, drop >=2σ below mean, baseline mean >=10/week |
-| 6 | No Steps Surfaced in 7 Days | Urgent (daily) | Silence gate, same shape as check 1, on `decision_engine_step__c` |
+| 6 | Low Engagement on Recent Starts | Urgent (daily) | *Adapted* — <10% of the pros who started 3-10 days ago have any step surfaced, step completed, or email sent for that cadence since their Start, excluding known non-rep-driven cadences by name |
 | 7 | Drop in Steps Surfaced | Report (Mon+Thu) | Same 8-week/2σ/min-10 rule as check 5 |
 | 8 | Drop in Steps Completed | Report (Mon+Thu) | Same 8-week/2σ/min-10 rule as check 5 |
 | 9 | Email Volume Drops/Spikes | Report (Mon+Thu) | Same 8-week/2σ/min-10 rule, flags **both** drop and spike |
@@ -42,10 +42,11 @@ Checks 2-4 exclude known-recurring-by-design cadences by name via `NOT TRIM(cade
 Original design ran everything daily; the requester's manager (Mario) and a stakeholder (Charlie)
 flagged in a separate Slack thread that daily statistical-drop alerts would become white noise,
 while genuinely broken cadences ("egregious" issues) still need to surface fast. Resolution:
-- **Urgent tier** (checks 1, 2, 3, 4, 6) — these are either silence gates (a cadence went
-  completely dark) or baseline anomalies (something new and abnormal just happened). Both mean
-  something likely just broke. Runs **daily**, posts **immediately** and **individually** per
-  breaching check/cadence, **stays silent on a clean day** (no white noise — these should be rare).
+- **Urgent tier** (checks 1, 2, 3, 4, 6) — these are silence gates (a cadence went completely
+  dark), cohort-ratio anomalies (a cadence's own recent pros are behaving abnormally), or
+  something new and abnormal just happened. All mean something likely just broke. Runs **daily**,
+  posts **immediately** and **individually** per breaching check/cadence, **stays silent on a
+  clean day** (no white noise — these should be rare).
 - **Report tier** (checks 5, 7, 8, 9, plus a recap of 1-4/6's current status) — these are
   8-week statistical drops/spikes, inherently a weekly-grain signal; a routine dip doesn't need
   same-day attention. Runs **twice a week (Monday + Thursday)**, and — unlike the urgent tier —
@@ -65,24 +66,118 @@ tops check 4's backlog at 169,152 pros — all expected for a long-running recur
 bug). Posting that literal, ever-growing all-time number to Slack every day would repeat a huge,
 barely-changing figure forever for those same cadences.
 
-Two approaches were tried:
+Three approaches were tried:
 1. **34-day statistical baseline** (first version, 2026-07-30): compare each cadence's daily count
    to its own trailing 34-day mean/stddev, flag only outliers. Validated live: correctly suppressed
    `HCP NPS Survey` (945 vs. mean 781, σ=109 → 1.5σ) and `Warming` (917 double-exits vs. mean 408,
    σ=396 → 1.3σ) while catching `Post-Enroll Flywheel: Type 1 to Type 3 Upsell` (51 vs. mean 6.5,
    σ=14.6 → ~3.0σ) as a real anomaly. Worked, but harder to explain/reason about for the team.
-2. **Trailing 7-day window + explicit exclusion list** (current, 2026-07-31, requester's own SQL):
-   count occurrences in the last 7 days, and hard-exclude cadences known to be recurring-by-design
-   via `NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')`. Simpler and more explainable, at the cost of
-   needing the exclusion list maintained by hand — other known-recurring cadences (`Warming`,
-   `Upsell`, `Abandoned My Apps Page`, `Retention - SaaS Cancellation`, `Inbound In Trial`, all
-   confirmed recurring-by-design in the 2026-07-30 validation) are **not yet excluded** and will
-   likely fire weekly until added. Add a cadence to the `ILIKE ANY (...)` list in checks 2-4 (three
-   places each) once it's confirmed to be by-design, not a bug — the ✅/❌ reaction feedback loop
-   (see "Anti-noise design") is the intended way to surface candidates.
+2. **Trailing 7-day window + explicit exclusion list** (2026-07-31, requester's own SQL): count
+   occurrences in the last 7 days, and hard-exclude cadences known to be recurring-by-design via
+   `NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')`. Simpler and more explainable, but a raw count
+   doesn't distinguish a high-volume cadence throwing off a handful of dupes from a low-volume one
+   where every start is doubling — and still needed the exclusion list maintained by hand.
+3. **% of the relevant denominator, same 7-day window + exclusion list** (current, 2026-08-03,
+   Diego's manager's feedback via Diego): keep the trailing-7-day window and exclusion list from
+   approach 2 (still needed — for recurring-by-design cadences, a "double start" can itself be the
+   expected re-send mechanism, so a high % there isn't automatically a bug), but flag on a
+   **percentage** instead of a raw count:
+   - **Check 2**: `double_start_count / total_starts_7d > 10%` (both counted over the same trailing
+     7-day window — using a single day's total was considered but rejected as too noisy for
+     low-volume cadences).
+   - **Check 3**: same shape, `double_exit_count / total_exits_7d > 10%`.
+   - **Check 4**: redefined from "newly crossed 100 days in the trailing 7 days" (a count) to
+     `stuck_pros / active_pros >= 10%`, where `active_pros` is the cadence's entire currently-active
+     pool (entered, not yet exited, any duration) and `stuck_pros` is the subset of that pool at
+     >=100 days. This is a snapshot ratio, not a "newly stuck" delta — self-normalizing across
+     cadence size, so it no longer needs the "newly crossed" windowing that approach 2 used to avoid
+     repeating a huge absolute backlog number daily. The existing per-check/cadence Slack-thread
+     repeat-suppression (see "Anti-noise design") now does that job instead.
+   10% was Diego's manager's own suggested starting point ("not positive what that % is, let's try
+   10%") — revisit if live results show it's still too loose/tight per cadence.
 
-Checks 1, 5, 6, 7, 8, 9 are used exactly as the source doc specifies — they're already windowed
+**Check 4 validation result (2026-08-03, important — read before treating a quiet day as
+"working as intended"):** live-queried at 10% before shipping. Checks 2 and 3 reduced cleanly —
+double-starts went from 19 cadences with any occurrence to 2 clearing >10% (`Inbound KA Low
+Intent` 34%, `Abandoned My Apps Page` 24%); double-exits went from 19 to 9 clearing >10%. Check 4
+did not: **47 of 57 cadences (82%) clear 10% stuck**, most at literally 100%, even after
+restricting to currently-live cadences (Start in trailing 4mo) with a 12-month entrant window and
+a min-10-active-pros floor (still 18 of 27, 67%). The apparent cause — not confirmed, stated as a
+data pattern only — is that a large share of pros in most cadences never get an `Exit` checkpoint
+recorded within 100 days; this looks like the norm rather than the exception across the system,
+echoing the already-documented `Exit`/`Break` recording inconsistency in `data-quality-caveats.md`.
+Decision (Diego, 2026-08-03): ship the 10% threshold as literally requested anyway and let the
+✅/❌ Slack reaction feedback loop (see "Anti-noise design") drive any retuning, rather than
+picking a different cutoff unilaterally. **Expect check 4 to fire on most active cadences daily**
+until that feedback loop pushes the threshold (or the definition) somewhere else — this is a
+known, accepted tradeoff, not a bug in the query.
+
+**Check 4 revised again (2026-08-05, Diego)** — added the trailing-120-day entrant window on
+`Start` that the 2026-08-03 validation above had already tried (as a 4mo/12mo variant) and found
+insufficient on its own; this time it's the only change and is applied directly in the `starts`
+CTE (not a separate liveness gate), restricting the active-pool denominator to pros who started
+within the last 120 days so pros stuck in a permanent no-Exit state for years don't dominate
+`stuck_pct` forever. **First pasted with the sign flipped** — `DATEADD(day, 120, CURRENT_DATE())`
+computes a date 120 days in the *future*, so `event_timestamp >= <future date>` matched nothing;
+confirmed live at 0 rows (this is what produced the empty check-4 section in the 2026-08-05
+artifact). Corrected to `DATEADD(day, -120, CURRENT_DATE())` before shipping. Live-validated
+after the fix: **13 cadences clear 10% stuck** (down from 47 of 57), each capped at exactly 120
+days for `longest_days_in_cadence` (confirms the window is binding as intended) — a large
+reduction from the 82% fire rate, though still worth watching via the ✅/❌ reaction loop.
+
+Checks 1, 5, 7, 8, 9 are used exactly as the source doc specifies — they're already windowed
 (silence gates or 8-week rolling baselines) and never had this all-time-cumulative problem.
+
+## Why check 6 differs from the source doc (redefined 2026-08-05 — Mario's request)
+The source doc's check 6 (and this skill's first live version) was a **silence gate**: 0 steps
+surfaced on `decision_engine_step__c` in the trailing 7 days, gated on >=1 surfaced in the
+trailing 4 months. Mario flagged in Slack that "0 surfaced" tells you almost nothing for most
+cadences — most weeks already look like 0 for anything but the highest-volume ones — and asked
+for an engagement-*rate* check instead. His refined proposal (checkmarked in-thread): for each
+cadence, take the pros whose Start fell in the rolling 3–10 day window; count how many of them
+have a step surfaced, a step completed, or an email sent for that cadence within that window;
+divide by the number of starts in the window; alert if the ratio is below 10%.
+
+Two implementation questions weren't fully specified in the Slack thread and were resolved with
+Diego, 2026-08-05, before shipping:
+- **Window scope for the "success" event**: literally restricting the surfaced/completed/emailed
+  event to the same 3-10-day-ago calendar band (vs. any time from the pro's own Start through
+  today) would undercount pros who started 9 days ago and got surfaced yesterday, outside that
+  band. Decision: count a success **any time from the pro's Start through today**, not restricted
+  back into the 3-10 day band itself.
+- **Email-sent data source**: `marts.communication.detail_communication_lifecycle` (the table
+  check 9 already uses for comms volume) has no `email` column — only `pro_uuid`/`lead_id`, which
+  would require branching the join by Pre- vs. Post-Enroll cadence type. Instead it's joined
+  through `marts.communication.detail_emails` (`comm_id = message_id`) to get `pro_email_address`,
+  then matched to the Start cohort by email directly — one join path for every cadence type.
+  Cadence match is still `workflow_name ILIKE '%cadence_id%'`, the same substring approach check 9
+  uses, with the same false-positive risk (see check 9's caveat #1 below) — spot-check flags.
+
+This is now architecturally the same %-of-denominator pattern checks 2-4 moved to on 2026-08-03
+(see above), just with a 3-10 day cohort window instead of a flat trailing-7-day one, and adds a
+third success signal (email sent) beyond the original surfaced/completed-only design. The
+known-quiet/non-rep-driven exclusion list carries over from the old check 6 unchanged.
+
+**Validation result (2026-08-05, live-queried before shipping):** of the 19 cadences with a
+3-10 day cohort right now, 4 cleared <10% engaged on first pass: `Post-Enroll Flywheel: Onboarding
+Email` (0%, cohort 125), `HCP NPS Survey 25-90-150-Recurring` (0.03%, cohort 10,717), `Pre-Enroll
+Flywheel: Inbound Demo Missed` (1.1%, cohort 623), `Post-Enroll Flywheel: Abandoned My Apps Page`
+(1.8%, cohort 5,746). The first two look like the same non-rep-driven/inherently-sparse pattern
+that got Warming/Activation excluded from the old check 6 (an NPS survey and a pure-email
+onboarding cadence are unlikely to ever clear the surfaced/completed leg, and evidently aren't
+matching on the email leg either — not confirmed why, could be workflow-name substring mismatch or
+genuinely low volume).
+
+**`HCP NPS Survey` added to the check-6 exclusion list (Diego, 2026-08-05)** — checks 2-4 already
+exclude it by name (`%HCP NPS%`) as a known recurring-by-design cadence; check 6 had never carried
+that same exclusion (its list is the separate "known-quiet" one: ARPA Engagement, Type 1
+Onboarding, Type 1 Adoption, Type 1 Nurture, Activation, Warming), so it fired here on first
+validation. Added `%HCP NPS%` to check 6's list in both SQL files.
+
+`Post-Enroll Flywheel: Onboarding Email` (0%) was **not** added — following the check-4 precedent
+(2026-08-03): ship the definition as requested and let the ✅/❌ Slack reaction feedback loop
+decide whether it needs excluding, rather than adding exclusions unilaterally. **Treat this one as
+a known first-week watch item**, not a confirmed bug in the query.
 
 ## Check 9's two known caveats (documented, not fixed — from the source doc, verified 2026-07-29)
 1. **Name-match false positive**: the join to `marts.communication.detail_communication_lifecycle`
@@ -274,12 +369,13 @@ queries against the same tables/knowledge base to answer in-thread.
 - Known-quiet cadences (Post-Enroll Flywheel: ARPA Engagement, Type 1 Onboarding, Type 1
   Adoption, Type 1 Nurture, Activation, Warming): checks 7/8's min-10-baseline-volume floor
   naturally excludes them (they never clear it) — no explicit list needed there. **Check 6 needs
-  an explicit exclusion list** (corrected 2026-07-31, caught by live validation): the 4-month
-  liveness gate does NOT exclude them the way it does for check 1 — a cadence can clear
-  `surfaced_last_4mo >= 1` on a single stray surfaced step and then trivially show `0` every
-  week after, since it's inherently sparse. Confirmed live: `Warming` and `Activation` fired on
-  check 6 before this fix. `cadence-alerts.sql`/`hightouch-combined-model.sql` check 6 now filters
-  `NOT cadence_id ILIKE ANY (...)` on the same name list.
+  an explicit exclusion list** (originally corrected 2026-07-31 for the old silence-gate version;
+  carried over into the 2026-08-05 cohort-ratio redefinition, plus `HCP NPS Survey` added the same
+  day — see "Why check 6 differs" above): these cadences are non-rep-driven and inherently sparse
+  on the surfaced/completed signal, so they'd otherwise show a near-0% engagement rate regardless
+  of whether anything is actually broken. `cadence-alerts.sql`/`hightouch-combined-model.sql`
+  check 6 filters `NOT TRIM(cadence_id) ILIKE ANY (...)` (now including `%HCP NPS%`, matching
+  checks 2-4's own exclusion of it) before building the cohort.
 - Governed tables (`ANALYTICS.MAIN`) rebuild nightly, not intraday — a same-day "no starts"
   won't show up until the next day's run; this is accepted latency, not a bug in the check.
 - Free-text `cadence_id` is `TRIM()`'d but **not case-normalized** anywhere in this file — a
@@ -287,7 +383,8 @@ queries against the same tables/knowledge base to answer in-thread.
   literal duplicate rows for at least one cadence pair).
 - Cross-table joins (checkpoint ↔ `decision_engine_step__c`) assume the same literal id is used in
   both `cadence_id` and `cadence_id__c`; check 9's join to `detail_communication_lifecycle` is a
-  substring `ILIKE` match instead (see check 9's caveat #1).
+  substring `ILIKE` match instead (see check 9's caveat #1) — check 6's email-sent leg
+  (added 2026-08-05) uses that same substring match and inherits the same risk.
 - **`knowledge/schema.md` line 28 documents a `cadence_name` column on
   `fact_journey_progress_checkpoint` that does not exist** (verified live via `SHOW COLUMNS`).
   `cadence_id` itself is the free-text descriptive label — every query here filters/matches on

@@ -42,7 +42,8 @@ c1_agg AS (
     GROUP BY cadence_id
 ),
 
--- ── Check 2: Double Starts (trailing 7 days, HCP NPS excluded) ───────────
+-- ── Check 2: Double Starts (>10% of trailing-7-day starts, HCP NPS excluded) ──
+-- REVISED 2026-08-03 (manager feedback): raw count → % of trailing-7-day total starts.
 c2_starts AS (
     SELECT TRIM(cadence_id) AS cadence_id, email, event_timestamp,
            ROW_NUMBER() OVER (PARTITION BY TRIM(cadence_id), email ORDER BY event_timestamp) AS start_seq,
@@ -59,18 +60,34 @@ c2_exits AS (
       AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
       AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
 ),
-c2_agg AS (
-    SELECT s.cadence_id, COUNT(*) AS double_start_count, COUNT(DISTINCT s.email) AS pros_affected
+c2_doubles AS (
+    SELECT s.cadence_id, s.email
     FROM c2_starts s
     WHERE s.start_seq > 1
       AND s.event_timestamp >= DATEADD(day, -7, CURRENT_DATE())
       AND NOT EXISTS (SELECT 1 FROM c2_exits e
                       WHERE e.cadence_id = s.cadence_id AND e.email = s.email
                         AND e.exit_ts > s.prev_start_ts AND e.exit_ts < s.event_timestamp)
-    GROUP BY s.cadence_id
+),
+c2_totals AS (
+    SELECT cadence_id, COUNT(*) AS total_starts_7d
+    FROM c2_starts
+    WHERE event_timestamp >= DATEADD(day, -7, CURRENT_DATE())
+    GROUP BY cadence_id
+),
+c2_agg AS (
+    SELECT d.cadence_id,
+           COUNT(*) AS double_start_count,
+           COUNT(DISTINCT d.email) AS pros_affected,
+           t.total_starts_7d,
+           ROUND(COUNT(*) / NULLIF(t.total_starts_7d, 0), 4) AS double_start_pct
+    FROM c2_doubles d
+    JOIN c2_totals t ON t.cadence_id = d.cadence_id
+    GROUP BY d.cadence_id, t.total_starts_7d
 ),
 
--- ── Check 3: Double Exits (trailing 7 days, HCP NPS excluded) ────────────
+-- ── Check 3: Double Exits (>10% of trailing-7-day exits, HCP NPS excluded) ──
+-- REVISED 2026-08-03 (manager feedback): raw count → % of trailing-7-day total exits.
 c3_exits AS (
     SELECT TRIM(cadence_id) AS cadence_id, email, event_timestamp,
            ROW_NUMBER() OVER (PARTITION BY TRIM(cadence_id), email ORDER BY event_timestamp) AS exit_seq,
@@ -87,24 +104,46 @@ c3_starts AS (
       AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
       AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
 ),
-c3_agg AS (
-    SELECT e.cadence_id, COUNT(*) AS double_exit_count, COUNT(DISTINCT e.email) AS pros_affected
+c3_doubles AS (
+    SELECT e.cadence_id, e.email
     FROM c3_exits e
     WHERE e.exit_seq > 1
       AND e.event_timestamp >= DATEADD(day, -7, CURRENT_DATE())
       AND NOT EXISTS (SELECT 1 FROM c3_starts s
                       WHERE s.cadence_id = e.cadence_id AND s.email = e.email
                         AND s.start_ts > e.prev_exit_ts AND s.start_ts < e.event_timestamp)
-    GROUP BY e.cadence_id
+),
+c3_totals AS (
+    SELECT cadence_id, COUNT(*) AS total_exits_7d
+    FROM c3_exits
+    WHERE event_timestamp >= DATEADD(day, -7, CURRENT_DATE())
+    GROUP BY cadence_id
+),
+c3_agg AS (
+    SELECT d.cadence_id,
+           COUNT(*) AS double_exit_count,
+           COUNT(DISTINCT d.email) AS pros_affected,
+           t.total_exits_7d,
+           ROUND(COUNT(*) / NULLIF(t.total_exits_7d, 0), 4) AS double_exit_pct
+    FROM c3_doubles d
+    JOIN c3_totals t ON t.cadence_id = d.cadence_id
+    GROUP BY d.cadence_id, t.total_exits_7d
 ),
 
--- ── Check 4: Newly stuck >100 days (crossed threshold in trailing 7 days) ──
+-- ── Check 4: Stuck >100 days (>=10% of currently-active pros in the cadence) ──
+-- REVISED 2026-08-03 (manager feedback): "newly crossed in trailing 7 days" count → % of the
+-- cadence's own currently-active pool (entered, not yet exited) that's stuck >=100 days.
+-- REVISED AGAIN 2026-08-05 (Diego): trailing-120-day entrant window on Start, to keep ancient
+-- perpetual-not-exited pros from dominating the active-pool denominator (see cadence-alerts.sql's
+-- check-4 header comment for the sign-bug catch/fix history — the shipped filter is `-120`, not
+-- `+120`).
 c4_starts AS (
     SELECT TRIM(cadence_id) AS cadence_id, email, MIN(event_timestamp) AS start_ts
     FROM analytics.main.fact_journey_progress_checkpoint
     WHERE cadence_step = 'Start'
       AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
       AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
+      AND event_timestamp >= DATEADD(day, -120, CURRENT_DATE())
     GROUP BY 1, 2
 ),
 c4_exits AS (
@@ -115,16 +154,20 @@ c4_exits AS (
       AND NOT TRIM(cadence_id) ILIKE ANY ('%HCP NPS%')
     GROUP BY 1, 2
 ),
-c4_agg AS (
-    SELECT s.cadence_id,
-           COUNT(*) AS newly_stuck_pros,
-           MAX(DATEDIFF(day, s.start_ts, CURRENT_DATE())) AS longest_days_in_cadence
+c4_active AS (
+    SELECT s.cadence_id, s.email, DATEDIFF(day, s.start_ts, CURRENT_DATE()) AS days_in_cadence
     FROM c4_starts s
     LEFT JOIN c4_exits e ON e.cadence_id = s.cadence_id AND e.email = s.email AND e.exit_ts > s.start_ts
     WHERE e.email IS NULL
-      AND DATEDIFF(day, s.start_ts, CURRENT_DATE()) >= 100
-      AND DATEDIFF(day, s.start_ts, CURRENT_DATE()) < 107
-    GROUP BY s.cadence_id
+),
+c4_agg AS (
+    SELECT cadence_id,
+           COUNT(*) AS active_pros,
+           COUNT_IF(days_in_cadence >= 100) AS stuck_pros,
+           ROUND(COUNT_IF(days_in_cadence >= 100) / NULLIF(COUNT(*), 0), 4) AS stuck_pct,
+           MAX(days_in_cadence) AS longest_days_in_cadence
+    FROM c4_active
+    GROUP BY cadence_id
 ),
 
 -- ── Check 5: Drop in Weekly Entries/Exits (8-week baseline, 2 SD, min 10) ──
@@ -182,24 +225,58 @@ c5_agg AS (
       AND exits <= exits_baseline_mean - 2 * exits_baseline_sd
 ),
 
--- ── Check 6: No Steps Surfaced in 7 Days ──────────────────────────────────
--- Explicit known-quiet exclusion required — see cadence-alerts.sql check 6's 2026-07-31 comment
--- (the 4-month liveness gate alone does NOT exclude these; confirmed live).
-c6_surfaced AS (
-    SELECT cadence_id__c AS cadence_id, createddate
+-- ── Check 6: Low Engagement on Recent Starts (<10% of the 3-10 day cohort engaged) ──
+-- REDEFINED 2026-08-05 (Mario's request via Slack thread) — mirrors cadence-alerts.sql's check 6
+-- exactly; see that file's header comment for the full rationale/history. Cohort = pros whose
+-- Start fell 3-10 days ago; engaged = ANY step surfaced, step completed, or email sent for that
+-- cadence, any time from their Start through today; alert if engaged_pct < 10%.
+-- 2026-08-05 live validation (19 cadences currently have a 3-10 day cohort): 4 cleared <10% on
+-- first pass, incl. `HCP NPS Survey 25-90-150-Recurring` (0.03%) — added to the exclusion list
+-- below (Diego, 2026-08-05) since it's non-rep-driven the same way Warming/Activation are, and
+-- checks 2-4 already exclude it by name. `Post-Enroll Flywheel: Onboarding Email` (0%) still
+-- clears <10% and is NOT excluded yet — same non-rep-driven/inherently-sparse pattern, but left as
+-- a first-week watch item per the check-4 precedent (ship as requested, let the (checkmark)/(x)
+-- reaction loop decide) rather than adding it unilaterally.
+c6_cohort AS (
+    SELECT TRIM(cadence_id) AS cadence_id, email, event_timestamp AS start_ts
+    FROM analytics.main.fact_journey_progress_checkpoint
+    WHERE cadence_step = 'Start'
+      AND SPLIT_PART(email, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
+      AND NOT TRIM(cadence_id) ILIKE ANY ('%ARPA Engagement%', '%Type 1 Onboarding%', '%Type 1 Adoption%',
+                                            '%Type 1 Nurture%', '%Activation%', '%Warming%', '%HCP NPS%')
+      AND event_timestamp::date BETWEEN DATEADD(day, -10, CURRENT_DATE()) AND DATEADD(day, -3, CURRENT_DATE())
+),
+c6_steps AS (
+    SELECT TRIM(cadence_id__c) AS cadence_id, email__c AS email, createddate, result_date_time__c
     FROM hcp_integrations.multi_salesforce_production.decision_engine_step__c
     WHERE step_id__c = 'Call attempt' AND name != 'clear_step'
       AND SPLIT_PART(email__c, '@', 2) NOT IN ('housecallpro.com', 'gethousecallpro.com')
-      AND NOT cadence_id__c ILIKE ANY ('%ARPA Engagement%', '%Type 1 Onboarding%', '%Type 1 Adoption%',
-                                        '%Type 1 Nurture%', '%Activation%', '%Warming%')
+),
+c6_emails_sent AS (
+    SELECT dcl.workflow_name, de.pro_email_address AS email, dcl.comm_date
+    FROM marts.communication.detail_communication_lifecycle dcl
+    JOIN marts.communication.detail_emails de ON dcl.comm_id = de.message_id
+    WHERE dcl.workflow_name IS NOT NULL
+),
+c6_engaged AS (
+    SELECT c.cadence_id, c.email
+    FROM c6_cohort c
+    JOIN c6_steps s ON s.cadence_id = c.cadence_id AND s.email = c.email
+                    AND (s.createddate >= c.start_ts OR s.result_date_time__c >= c.start_ts)
+    UNION
+    SELECT c.cadence_id, c.email
+    FROM c6_cohort c
+    JOIN c6_emails_sent e ON e.workflow_name ILIKE '%' || c.cadence_id || '%' AND e.email = c.email
+                          AND e.comm_date >= c.start_ts
 ),
 c6_agg AS (
-    SELECT cadence_id,
-           COUNT_IF(createddate >= DATEADD(month, -4, CURRENT_DATE())) AS surfaced_last_4mo,
-           COUNT_IF(createddate >= DATEADD(day, -7, CURRENT_DATE()))   AS surfaced_last_7d,
-           MAX(createddate) AS last_surfaced_ts
-    FROM c6_surfaced
-    GROUP BY cadence_id
+    SELECT c.cadence_id,
+           COUNT(DISTINCT c.email)  AS cohort_size,
+           COUNT(DISTINCT eg.email) AS engaged_count,
+           ROUND(COUNT(DISTINCT eg.email) / NULLIF(COUNT(DISTINCT c.email), 0), 4) AS engaged_pct
+    FROM c6_cohort c
+    LEFT JOIN c6_engaged eg ON eg.cadence_id = c.cadence_id AND eg.email = c.email
+    GROUP BY c.cadence_id
 ),
 
 -- ── Check 7: Drop in Steps Surfaced (8-week baseline, 2 SD, min 10) ───────
@@ -347,23 +424,29 @@ FROM c1_agg WHERE starts_last_4mo >= 1 AND starts_last_7d = 0
 UNION ALL
 SELECT '2|' || cadence_id || '|' || TO_VARCHAR(CURRENT_DATE()),
        2, 'Double Starts', cadence_id, NULL,
-       double_start_count, NULL,
-       'pros_affected=' || pros_affected, CURRENT_DATE()
-FROM c2_agg
+       double_start_pct, 0.10,
+       'double_start_count=' || double_start_count || '; total_starts_7d=' || total_starts_7d
+           || '; pros_affected=' || pros_affected,
+       CURRENT_DATE()
+FROM c2_agg WHERE double_start_pct > 0.10
 
 UNION ALL
 SELECT '3|' || cadence_id || '|' || TO_VARCHAR(CURRENT_DATE()),
        3, 'Double Exits', cadence_id, NULL,
-       double_exit_count, NULL,
-       'pros_affected=' || pros_affected, CURRENT_DATE()
-FROM c3_agg
+       double_exit_pct, 0.10,
+       'double_exit_count=' || double_exit_count || '; total_exits_7d=' || total_exits_7d
+           || '; pros_affected=' || pros_affected,
+       CURRENT_DATE()
+FROM c3_agg WHERE double_exit_pct > 0.10
 
 UNION ALL
 SELECT '4|' || cadence_id || '|' || TO_VARCHAR(CURRENT_DATE()),
        4, 'Entered Not Exited in 100+ Days', cadence_id, NULL,
-       newly_stuck_pros, 100,
-       'longest_days_in_cadence=' || longest_days_in_cadence, CURRENT_DATE()
-FROM c4_agg
+       stuck_pct, 0.10,
+       'stuck_pros=' || stuck_pros || '; active_pros=' || active_pros
+           || '; longest_days_in_cadence=' || longest_days_in_cadence,
+       CURRENT_DATE()
+FROM c4_agg WHERE stuck_pct >= 0.10
 
 UNION ALL
 SELECT '5|' || cadence_id || '|' || TO_VARCHAR(week_start) || '|' || metric_name,
@@ -375,10 +458,11 @@ FROM c5_agg
 
 UNION ALL
 SELECT '6|' || cadence_id || '|' || TO_VARCHAR(CURRENT_DATE()),
-       6, 'No Steps Surfaced in 7 Days', cadence_id, NULL,
-       surfaced_last_7d, 7,
-       'last_surfaced_ts=' || TO_VARCHAR(last_surfaced_ts), CURRENT_DATE()
-FROM c6_agg WHERE surfaced_last_4mo >= 1 AND surfaced_last_7d = 0
+       6, 'Low Engagement on Recent Starts', cadence_id, NULL,
+       engaged_pct, 0.10,
+       'cohort_size=' || cohort_size || '; engaged_count=' || engaged_count,
+       CURRENT_DATE()
+FROM c6_agg WHERE engaged_pct < 0.10
 
 UNION ALL
 SELECT '7|' || cadence_id || '|' || TO_VARCHAR(week_start),
